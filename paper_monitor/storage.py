@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS papers (
     summary_text TEXT NOT NULL DEFAULT '',
     summary_basis TEXT NOT NULL DEFAULT 'metadata-only',
     tags_json TEXT NOT NULL DEFAULT '[]',
+    pdf_local_path TEXT NOT NULL DEFAULT '',
+    pdf_status TEXT NOT NULL DEFAULT 'pending',
+    pdf_downloaded_at TEXT,
+    fulltext_txt_path TEXT NOT NULL DEFAULT '',
+    fulltext_excerpt TEXT NOT NULL DEFAULT '',
+    fulltext_status TEXT NOT NULL DEFAULT 'empty',
+    page_count INTEGER,
+    llm_summary_json TEXT NOT NULL DEFAULT '{}',
+    analysis_updated_at TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     source_first TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -100,6 +109,18 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 """
 
+PAPER_COLUMN_MIGRATIONS = {
+    "pdf_local_path": "ALTER TABLE papers ADD COLUMN pdf_local_path TEXT NOT NULL DEFAULT ''",
+    "pdf_status": "ALTER TABLE papers ADD COLUMN pdf_status TEXT NOT NULL DEFAULT 'pending'",
+    "pdf_downloaded_at": "ALTER TABLE papers ADD COLUMN pdf_downloaded_at TEXT",
+    "fulltext_txt_path": "ALTER TABLE papers ADD COLUMN fulltext_txt_path TEXT NOT NULL DEFAULT ''",
+    "fulltext_excerpt": "ALTER TABLE papers ADD COLUMN fulltext_excerpt TEXT NOT NULL DEFAULT ''",
+    "fulltext_status": "ALTER TABLE papers ADD COLUMN fulltext_status TEXT NOT NULL DEFAULT 'empty'",
+    "page_count": "ALTER TABLE papers ADD COLUMN page_count INTEGER",
+    "llm_summary_json": "ALTER TABLE papers ADD COLUMN llm_summary_json TEXT NOT NULL DEFAULT '{}'",
+    "analysis_updated_at": "ALTER TABLE papers ADD COLUMN analysis_updated_at TEXT",
+}
+
 
 class Database:
     def __init__(self, path: Path, timezone_name: str) -> None:
@@ -115,7 +136,20 @@ class Database:
 
     def initialize(self) -> None:
         self.connection.executescript(SCHEMA)
+        self._run_migrations()
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_papers_fulltext_status ON papers(fulltext_status)"
+        )
         self.connection.commit()
+
+    def _run_migrations(self) -> None:
+        existing_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(papers)").fetchall()
+        }
+        for column_name, ddl in PAPER_COLUMN_MIGRATIONS.items():
+            if column_name in existing_columns:
+                continue
+            self.connection.execute(ddl)
 
     def _find_existing_paper(self, candidate: PaperCandidate) -> sqlite3.Row | None:
         if candidate.doi:
@@ -290,20 +324,76 @@ class Database:
             summary_text=row["summary_text"] or "",
             summary_basis=row["summary_basis"] or "metadata-only",
             tags=safe_json_loads(row["tags_json"], []),
+            pdf_local_path=row["pdf_local_path"] or "",
+            pdf_status=row["pdf_status"] or "pending",
+            pdf_downloaded_at=row["pdf_downloaded_at"],
+            fulltext_txt_path=row["fulltext_txt_path"] or "",
+            fulltext_excerpt=row["fulltext_excerpt"] or "",
+            fulltext_status=row["fulltext_status"] or "empty",
+            page_count=row["page_count"],
+            llm_summary=safe_json_loads(row["llm_summary_json"], {}),
+            analysis_updated_at=row["analysis_updated_at"],
             source_first=row["source_first"],
             created_at=row["created_at"],
             last_seen_at=row["last_seen_at"],
             metadata=safe_json_loads(row["metadata_json"], {}),
         )
 
-    def update_paper_analysis(self, paper_id: int, summary_text: str, summary_basis: str, tags: list[str]) -> None:
+    def update_paper_analysis(
+        self,
+        paper_id: int,
+        summary_text: str,
+        summary_basis: str,
+        tags: list[str],
+        llm_summary: dict[str, Any] | None = None,
+    ) -> None:
+        now = now_iso(self.timezone_name)
         self.connection.execute(
             """
             UPDATE papers
-            SET summary_text = ?, summary_basis = ?, tags_json = ?
+            SET summary_text = ?, summary_basis = ?, tags_json = ?, llm_summary_json = ?, analysis_updated_at = ?
             WHERE id = ?
             """,
-            (summary_text, summary_basis, json_dumps(unique_strings(tags)), paper_id),
+            (
+                summary_text,
+                summary_basis,
+                json_dumps(unique_strings(tags)),
+                json_dumps(llm_summary or {}),
+                now,
+                paper_id,
+            ),
+        )
+        self.connection.commit()
+
+    def update_paper_assets(
+        self,
+        paper_id: int,
+        *,
+        pdf_local_path: str,
+        pdf_status: str,
+        pdf_downloaded_at: str | None,
+        fulltext_txt_path: str,
+        fulltext_excerpt: str,
+        fulltext_status: str,
+        page_count: int | None,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE papers
+            SET pdf_local_path = ?, pdf_status = ?, pdf_downloaded_at = ?, fulltext_txt_path = ?,
+                fulltext_excerpt = ?, fulltext_status = ?, page_count = ?
+            WHERE id = ?
+            """,
+            (
+                pdf_local_path,
+                pdf_status,
+                pdf_downloaded_at,
+                fulltext_txt_path,
+                fulltext_excerpt,
+                fulltext_status,
+                page_count,
+                paper_id,
+            ),
         )
         self.connection.commit()
 
@@ -355,9 +445,65 @@ class Database:
         self.connection.commit()
         return False
 
+    def fetch_paper_evaluations(self, paper_id: int) -> list[TopicEvaluation]:
+        rows = self.connection.execute(
+            """
+            SELECT topic_id, topic_name, score, classification, matched_keywords_json, reasons_json
+            FROM matches
+            WHERE paper_id = ?
+            ORDER BY score DESC, topic_name ASC
+            """,
+            (paper_id,),
+        ).fetchall()
+        return [
+            TopicEvaluation(
+                topic_id=row["topic_id"],
+                topic_name=row["topic_name"],
+                score=float(row["score"]),
+                classification=row["classification"],
+                matched_keywords=safe_json_loads(row["matched_keywords_json"], []),
+                reasons=safe_json_loads(row["reasons_json"], []),
+            )
+            for row in rows
+        ]
+
+    def fetch_enrichment_candidates(
+        self,
+        limit: int,
+        classifications: list[str],
+        topic_ids: list[str] | None = None,
+    ) -> list[PaperRecord]:
+        if not classifications:
+            return []
+        placeholders = ", ".join(["?"] * len(classifications))
+        params: list[Any] = list(classifications)
+        topic_filter = ""
+        if topic_ids:
+            topic_placeholders = ", ".join(["?"] * len(topic_ids))
+            topic_filter = f" AND m.topic_id IN ({topic_placeholders})"
+            params.extend(topic_ids)
+        params.append(limit)
+
+        rows = self.connection.execute(
+            f"""
+            SELECT p.*, MAX(m.score) AS best_score
+            FROM papers p
+            JOIN matches m ON m.paper_id = p.id
+            WHERE m.classification IN ({placeholders})
+            {topic_filter}
+            GROUP BY p.id
+            ORDER BY best_score DESC, p.created_at DESC, p.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_paper(row) for row in rows]
+
     def fetch_report_entries(self, start_at: str, end_at: str, include_maybe: bool) -> list[ReportEntry]:
         classifications = ("relevant", "maybe") if include_maybe else ("relevant",)
         placeholders = ", ".join(["?"] * len(classifications))
+        start_day = start_at[:10]
+        end_day = end_at[:10]
         rows = self.connection.execute(
             f"""
             SELECT
@@ -373,12 +519,15 @@ class Database:
             FROM matches m
             JOIN papers p ON p.id = m.paper_id
             LEFT JOIN paper_sources ps ON ps.paper_id = p.id
-            WHERE p.created_at BETWEEN ? AND ?
+            WHERE (
+                p.created_at BETWEEN ? AND ?
+                OR substr(COALESCE(NULLIF(p.published_at, ''), p.created_at), 1, 10) BETWEEN ? AND ?
+            )
               AND m.classification IN ({placeholders})
             GROUP BY m.id
             ORDER BY m.topic_name ASC, m.score DESC, p.published_at DESC, p.id DESC
             """,
-            (start_at, end_at, *classifications),
+            (start_at, end_at, start_day, end_day, *classifications),
         ).fetchall()
 
         entries: list[ReportEntry] = []
@@ -404,15 +553,20 @@ class Database:
     def count_matches(self, start_at: str, end_at: str, include_maybe: bool) -> int:
         classifications = ("relevant", "maybe") if include_maybe else ("relevant",)
         placeholders = ", ".join(["?"] * len(classifications))
+        start_day = start_at[:10]
+        end_day = end_at[:10]
         row = self.connection.execute(
             f"""
             SELECT COUNT(*) AS count
             FROM matches m
             JOIN papers p ON p.id = m.paper_id
-            WHERE p.created_at BETWEEN ? AND ?
+            WHERE (
+                p.created_at BETWEEN ? AND ?
+                OR substr(COALESCE(NULLIF(p.published_at, ''), p.created_at), 1, 10) BETWEEN ? AND ?
+            )
               AND m.classification IN ({placeholders})
             """,
-            (start_at, end_at, *classifications),
+            (start_at, end_at, start_day, end_day, *classifications),
         ).fetchone()
         return int(row["count"])
 

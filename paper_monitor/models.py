@@ -48,6 +48,35 @@ class ReportConfig:
 
 
 @dataclass(slots=True)
+class EnrichmentConfig:
+    enabled: bool = True
+    pdf_dir: Path = Path("artifacts/pdfs")
+    text_dir: Path = Path("artifacts/text")
+    download_timeout_seconds: int = 60
+    max_papers_per_run: int = 20
+    redownload_existing: bool = False
+    use_pdftotext: bool = True
+    excerpt_chars: int = 12000
+    process_classifications: list[str] = field(default_factory=lambda: ["relevant", "maybe"])
+
+
+@dataclass(slots=True)
+class LLMConfig:
+    enabled: bool = False
+    provider: str = "openai_compatible"
+    base_url: str = ""
+    api_key_env: str = "LLM_API_KEY"
+    model: str = ""
+    timeout_seconds: int = 60
+    temperature: float = 0.2
+    max_input_chars: int = 16000
+    max_output_tokens: int = 700
+    store: bool = False
+    enable_topic_digest: bool = False
+    topic_digest_entry_limit: int = 8
+
+
+@dataclass(slots=True)
 class Settings:
     base_dir: Path
     config_path: Path
@@ -60,6 +89,8 @@ class Settings:
     dblp: GenericSourceConfig
     scholar_alerts: ScholarAlertsConfig
     report: ReportConfig
+    enrichment: EnrichmentConfig
+    llm: LLMConfig
     topics: list[TopicConfig]
 
 
@@ -102,6 +133,15 @@ class PaperRecord:
     summary_text: str
     summary_basis: str
     tags: list[str]
+    pdf_local_path: str
+    pdf_status: str
+    pdf_downloaded_at: str | None
+    fulltext_txt_path: str
+    fulltext_excerpt: str
+    fulltext_status: str
+    page_count: int | None
+    llm_summary: dict[str, Any]
+    analysis_updated_at: str | None
     source_first: str
     created_at: str
     last_seen_at: str
@@ -132,10 +172,32 @@ class ReportEntry:
 
 
 @dataclass(slots=True)
+class LLMResult:
+    summary_text: str
+    summary_basis: str
+    tags: list[str]
+    structured: dict[str, Any]
+
+
+@dataclass(slots=True)
+class TopicDigest:
+    overview: str
+    highlights: list[str]
+    watchlist: list[str]
+    tags: list[str]
+    structured: dict[str, Any]
+
+
+@dataclass(slots=True)
 class RunStats:
     fetched: int = 0
     processed: int = 0
     stored: int = 0
     matched: int = 0
+    enriched: int = 0
+    downloaded_pdfs: int = 0
+    extracted_texts: int = 0
+    llm_summaries: int = 0
+    skipped: int = 0
     by_source: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)

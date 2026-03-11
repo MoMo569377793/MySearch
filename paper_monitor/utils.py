@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -125,3 +127,19 @@ def shorten(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def stable_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def clean_extracted_text(text: str) -> str:
+    cleaned = text.replace("\x00", " ")
+    cleaned = cleaned.replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()

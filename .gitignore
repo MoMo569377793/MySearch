@@ -7,3 +7,5 @@ reports/daily/*.html
 reports/weekly/*.md
 reports/weekly/*.html
 exports/*.json
+artifacts/pdfs/*
+artifacts/text/*

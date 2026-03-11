@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -25,12 +27,29 @@ class DBLPFetcher:
         for query in queries:
             params = urllib.parse.urlencode({"q": query, "h": self.config.max_results, "f": 0, "format": "json"})
             url = f"https://dblp.org/search/publ/api?{params}"
-            request = urllib.request.Request(url, headers={"User-Agent": self.config.user_agent})
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                payload = response.read().decode("utf-8")
+            payload = self._fetch_with_retry(url, query)
+            if not payload:
+                continue
             candidates.extend(self._parse_json(payload, query))
         LOGGER.info("dblp topic=%s fetched=%s", topic.id, len(candidates))
         return candidates
+
+    def _fetch_with_retry(self, url: str, query: str) -> str | None:
+        for attempt in range(3):
+            request = urllib.request.Request(url, headers={"User-Agent": self.config.user_agent})
+            try:
+                with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                if exc.code >= 500 and attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                LOGGER.warning("dblp query failed: %s (%s)", query, exc)
+                return None
+            except urllib.error.URLError as exc:
+                LOGGER.warning("dblp query failed: %s (%s)", query, exc)
+                return None
+        return None
 
     def _parse_json(self, payload: str, query: str) -> list[PaperCandidate]:
         data = json.loads(payload)

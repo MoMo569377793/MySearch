@@ -5,6 +5,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from paper_monitor.llm import LLMClient
 from paper_monitor.models import ReportEntry, Settings
 from paper_monitor.storage import Database
 from paper_monitor.utils import ensure_directory, shorten, to_day_bounds
@@ -37,6 +38,7 @@ def _render_markdown(
     start_at: str,
     end_at: str,
     grouped_entries: dict[str, list[ReportEntry]],
+    topic_digests: dict[str, dict],
     settings: Settings,
 ) -> str:
     total = sum(len(items) for items in grouped_entries.values())
@@ -59,6 +61,21 @@ def _render_markdown(
         lines.append("")
         lines.append(f"- 命中数量：`{len(entries)}`")
         lines.append(f"- 趋势摘要：{_topic_trend_sentence(entries)}")
+        digest = topic_digests.get(topic.id)
+        if digest:
+            lines.append(f"- LLM 主题概览：{digest.get('overview', '')}")
+            highlights = digest.get("highlights", [])
+            if highlights:
+                lines.append(f"- LLM 关键观察：`{' | '.join(highlights[:3])}`")
+            watchlist = digest.get("watchlist", [])
+            if watchlist:
+                lines.append(f"- LLM 建议关注：`{' | '.join(watchlist[:3])}`")
+            usage = digest.get("usage", {})
+            if usage:
+                lines.append(
+                    f"- LLM Token：in `{usage.get('input_tokens', '未知')}` / "
+                    f"out `{usage.get('output_tokens', '未知')}` / total `{usage.get('total_tokens', '未知')}`"
+                )
         lines.append("")
 
         if not entries:
@@ -74,10 +91,20 @@ def _render_markdown(
             lines.append(f"- 来源：`{', '.join(entry.source_names) or paper.source_first}`")
             lines.append(f"- 发布时间：`{paper.published_at or '未知'}`")
             lines.append(f"- Venue / 分类：`{paper.venue or '未知'}` / `{', '.join(paper.categories) or '无'}`")
+            lines.append(
+                f"- 全文状态：`{paper.fulltext_status}` / PDF `{paper.pdf_status}` / "
+                f"页数 `{paper.page_count or '未知'}` / 总结来源 `{paper.summary_basis or '未知'}`"
+            )
             lines.append(f"- 匹配词：`{', '.join(entry.matched_keywords) or '无'}`")
             lines.append(f"- 链接：{paper.primary_url or (entry.source_urls[0] if entry.source_urls else '无')}")
+            if paper.pdf_local_path:
+                lines.append(f"- 本地 PDF：`{paper.pdf_local_path}`")
+            if paper.fulltext_txt_path:
+                lines.append(f"- 全文文本：`{paper.fulltext_txt_path}`")
             lines.append(f"- 机器总结：{paper.summary_text}")
-            if paper.abstract:
+            if paper.fulltext_excerpt:
+                lines.append(f"- 全文节选：{shorten(paper.fulltext_excerpt, 320)}")
+            elif paper.abstract:
                 lines.append(f"- 摘要片段：{shorten(paper.abstract, 320)}")
             lines.append("")
 
@@ -90,12 +117,14 @@ def _render_html(
     start_at: str,
     end_at: str,
     grouped_entries: dict[str, list[ReportEntry]],
+    topic_digests: dict[str, dict],
     settings: Settings,
 ) -> str:
     label = _report_label(report_type)
     sections: list[str] = []
     for topic in settings.topics:
         entries = grouped_entries.get(topic.id, [])
+        digest = topic_digests.get(topic.id, {})
         cards: list[str] = []
         for entry in entries[: settings.report.top_n_per_topic]:
             paper = entry.paper
@@ -105,9 +134,10 @@ def _render_html(
                   <h3>{html.escape(paper.title)}</h3>
                   <p class="meta">相关性 {entry.classification} / 分数 {entry.score} / 来源 {html.escape(', '.join(entry.source_names) or paper.source_first)}</p>
                   <p class="meta">发布时间 {html.escape(paper.published_at or '未知')} / Venue {html.escape(paper.venue or '未知')}</p>
+                  <p class="meta">全文状态 {html.escape(paper.fulltext_status)} / PDF {html.escape(paper.pdf_status)} / 页数 {html.escape(str(paper.page_count or '未知'))} / 总结来源 {html.escape(paper.summary_basis or '未知')}</p>
                   <p><strong>匹配词：</strong>{html.escape(', '.join(entry.matched_keywords) or '无')}</p>
                   <p><strong>机器总结：</strong>{html.escape(paper.summary_text)}</p>
-                  <p><strong>摘要片段：</strong>{html.escape(shorten(paper.abstract or '无摘要', 360))}</p>
+                  <p><strong>{'全文节选' if paper.fulltext_excerpt else '摘要片段'}：</strong>{html.escape(shorten(paper.fulltext_excerpt or paper.abstract or '无摘要', 360))}</p>
                   <p><a href="{html.escape(paper.primary_url or (entry.source_urls[0] if entry.source_urls else '#'))}">打开原始链接</a></p>
                 </article>
                 """
@@ -121,6 +151,9 @@ def _render_html(
                 <h2>{html.escape(topic.display_name)}</h2>
                 <p>{html.escape(topic.description)}</p>
                 <p class="trend">{html.escape(_topic_trend_sentence(entries))}</p>
+                {f'<p><strong>LLM 主题概览：</strong>{html.escape(digest.get("overview", ""))}</p>' if digest.get("overview") else ''}
+                {f'<p><strong>LLM 关键观察：</strong>{html.escape(" | ".join(digest.get("highlights", [])[:3]))}</p>' if digest.get("highlights") else ''}
+                {f'<p><strong>LLM 建议关注：</strong>{html.escape(" | ".join(digest.get("watchlist", [])[:3]))}</p>' if digest.get("watchlist") else ''}
               </div>
               {''.join(cards)}
             </section>
@@ -216,6 +249,8 @@ def generate_report(
     report_date: str,
     report_type: str,
     lookback_days: int | None = None,
+    llm_client: LLMClient | None = None,
+    use_llm_topic_digest: bool = False,
 ) -> dict[str, str]:
     actual_lookback = lookback_days or settings.report.lookback_days
     start_at, end_at = to_day_bounds(report_date, settings.timezone, actual_lookback)
@@ -223,19 +258,50 @@ def generate_report(
     grouped_entries: dict[str, list[ReportEntry]] = defaultdict(list)
     for entry in entries:
         grouped_entries[entry.topic_id].append(entry)
+    topic_digests: dict[str, dict] = {}
+    if llm_client and use_llm_topic_digest:
+        for topic in settings.topics:
+            topic_entries = grouped_entries.get(topic.id, [])
+            digest = llm_client.generate_topic_digest(topic.display_name, topic.description, topic_entries)
+            if digest is None:
+                continue
+            topic_digests[topic.id] = {
+                "overview": digest.overview,
+                "highlights": digest.highlights,
+                "watchlist": digest.watchlist,
+                "tags": digest.tags,
+                "usage": digest.structured.get("usage", {}),
+            }
 
     report_root = settings.report_dir / report_type
     ensure_directory(report_root)
     ensure_directory(settings.export_dir)
 
-    markdown_text = _render_markdown(report_type, report_date, start_at, end_at, grouped_entries, settings)
-    html_text = _render_html(report_type, report_date, start_at, end_at, grouped_entries, settings)
+    markdown_text = _render_markdown(
+        report_type,
+        report_date,
+        start_at,
+        end_at,
+        grouped_entries,
+        topic_digests,
+        settings,
+    )
+    html_text = _render_html(
+        report_type,
+        report_date,
+        start_at,
+        end_at,
+        grouped_entries,
+        topic_digests,
+        settings,
+    )
     json_text = json.dumps(
         {
             "report_type": report_type,
             "report_date": report_date,
             "start_at": start_at,
             "end_at": end_at,
+            "topic_digests": topic_digests,
             "topics": {
                 topic_id: [
                     {
@@ -249,8 +315,14 @@ def generate_report(
                             "published_at": entry.paper.published_at,
                             "primary_url": entry.paper.primary_url,
                             "summary_text": entry.paper.summary_text,
+                            "summary_basis": entry.paper.summary_basis,
                             "venue": entry.paper.venue,
                             "categories": entry.paper.categories,
+                            "pdf_status": entry.paper.pdf_status,
+                            "pdf_local_path": entry.paper.pdf_local_path,
+                            "fulltext_status": entry.paper.fulltext_status,
+                            "fulltext_txt_path": entry.paper.fulltext_txt_path,
+                            "page_count": entry.paper.page_count,
                         },
                     }
                     for entry in topic_entries
@@ -279,6 +351,7 @@ def generate_report(
             "match_count": len(entries),
             "lookback_days": actual_lookback,
             "top_n_per_topic": settings.report.top_n_per_topic,
+            "topic_digests": list(topic_digests.keys()),
         },
     )
 

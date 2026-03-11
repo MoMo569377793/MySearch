@@ -61,7 +61,7 @@ class ArxivFetcher:
                 href = link_node.attrib.get("href", "")
                 title_attr = link_node.attrib.get("title", "")
                 rel = link_node.attrib.get("rel", "")
-                if title_attr == "pdf" or rel == "related":
+                if title_attr == "pdf" or "/pdf/" in href:
                     pdf_url = href
                 if rel == "alternate" and href:
                     primary_url = href

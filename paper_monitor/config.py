@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 from paper_monitor.models import (
+    EnrichmentConfig,
     GenericSourceConfig,
+    LLMConfig,
     ReportConfig,
     ScholarAlertsConfig,
     Settings,
@@ -48,6 +50,31 @@ DEFAULT_CONFIG = {
         "top_n_per_topic": 5,
         "lookback_days": 1,
         "include_maybe": True,
+    },
+    "enrichment": {
+        "enabled": True,
+        "pdf_dir": "artifacts/pdfs",
+        "text_dir": "artifacts/text",
+        "download_timeout_seconds": 60,
+        "max_papers_per_run": 20,
+        "redownload_existing": False,
+        "use_pdftotext": True,
+        "excerpt_chars": 12000,
+        "process_classifications": ["relevant", "maybe"],
+    },
+    "llm": {
+        "enabled": False,
+        "provider": "openai_compatible",
+        "base_url": "",
+        "api_key_env": "LLM_API_KEY",
+        "model": "",
+        "timeout_seconds": 60,
+        "temperature": 0.2,
+        "max_input_chars": 16000,
+        "max_output_tokens": 700,
+        "store": False,
+        "enable_topic_digest": False,
+        "topic_digest_entry_limit": 8,
     },
     "topics": [
         {
@@ -180,6 +207,19 @@ def load_settings(config_path: str | Path) -> Settings:
     dblp = GenericSourceConfig(**sources.get("dblp", {}))
     scholar_alerts = ScholarAlertsConfig(**sources.get("google_scholar_alerts", {}))
     report = ReportConfig(**raw.get("report", {}))
+    enrichment_raw = raw.get("enrichment", {})
+    enrichment = EnrichmentConfig(
+        enabled=bool(enrichment_raw.get("enabled", True)),
+        pdf_dir=(base_dir / enrichment_raw.get("pdf_dir", "artifacts/pdfs")).resolve(),
+        text_dir=(base_dir / enrichment_raw.get("text_dir", "artifacts/text")).resolve(),
+        download_timeout_seconds=int(enrichment_raw.get("download_timeout_seconds", 60)),
+        max_papers_per_run=int(enrichment_raw.get("max_papers_per_run", 20)),
+        redownload_existing=bool(enrichment_raw.get("redownload_existing", False)),
+        use_pdftotext=bool(enrichment_raw.get("use_pdftotext", True)),
+        excerpt_chars=int(enrichment_raw.get("excerpt_chars", 12000)),
+        process_classifications=list(enrichment_raw.get("process_classifications", ["relevant", "maybe"])),
+    )
+    llm = LLMConfig(**raw.get("llm", {}))
 
     topics = [TopicConfig(**topic_raw) for topic_raw in raw.get("topics", [])]
     if not topics:
@@ -197,6 +237,8 @@ def load_settings(config_path: str | Path) -> Settings:
         dblp=dblp,
         scholar_alerts=scholar_alerts,
         report=report,
+        enrichment=enrichment,
+        llm=llm,
         topics=topics,
     )
 

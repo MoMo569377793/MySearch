@@ -34,6 +34,34 @@
     "lookback_days": 1,
     "include_maybe": true
   },
+  "enrichment": {
+    "enabled": true,
+    "pdf_dir": "artifacts/pdfs",
+    "text_dir": "artifacts/text",
+    "download_timeout_seconds": 60,
+    "max_papers_per_run": 20,
+    "redownload_existing": false,
+    "use_pdftotext": true,
+    "excerpt_chars": 12000,
+    "process_classifications": [
+      "relevant",
+      "maybe"
+    ]
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "openai_compatible",
+    "base_url": "https://ai.saurlax.com/v1",
+    "api_key_env": "LLM_API_KEY",
+    "model": "gpt-5",
+    "timeout_seconds": 60,
+    "temperature": 0.2,
+    "max_input_chars": 16000,
+    "max_output_tokens": 700,
+    "store": false,
+    "enable_topic_digest": true,
+    "topic_digest_entry_limit": 8
+  },
   "topics": [
     {
       "id": "matrix_free_fem",

@@ -69,8 +69,17 @@ class MonitorPipeline:
                 saved_matches += 1
             interesting_tags.extend(evaluation.matched_keywords[:4])
 
-        summary_text, basis, tags = build_paper_summary(paper, evaluations)
-        self.db.update_paper_analysis(paper_id, summary_text, basis, interesting_tags + tags)
+        if paper.summary_basis.startswith("llm+") and paper.summary_text:
+            self.db.update_paper_analysis(
+                paper_id,
+                paper.summary_text,
+                paper.summary_basis,
+                interesting_tags + paper.tags,
+                llm_summary=paper.llm_summary,
+            )
+        else:
+            summary_text, basis, tags = build_paper_summary(paper, evaluations)
+            self.db.update_paper_analysis(paper_id, summary_text, basis, interesting_tags + tags)
 
         stats.processed += 1
         if created:
