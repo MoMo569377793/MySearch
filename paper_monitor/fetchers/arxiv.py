@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 from paper_monitor.models import FetchPlan, GenericSourceConfig, PaperCandidate, TopicConfig
-from paper_monitor.utils import normalize_whitespace
+from paper_monitor.utils import normalize_whitespace, parse_source_datetime
 
 
 LOGGER = logging.getLogger(__name__)
@@ -53,8 +53,10 @@ class ArxivFetcher:
             scan_cap = max(scan_cap, 500)
 
         items: list[PaperCandidate] = []
-        while scanned < scan_cap:
+        while plan.since_at is not None or scanned < scan_cap:
             request_size = min(page_size, scan_cap - scanned)
+            if plan.since_at is not None:
+                request_size = page_size
             params = urllib.parse.urlencode(
                 {
                     "search_query": query,
@@ -69,6 +71,14 @@ class ArxivFetcher:
             batch = self._parse_feed(xml_text, query)
             if not batch:
                 break
+            if plan.since_at:
+                filtered_batch = self._filter_since(batch, plan.since_at)
+                items.extend(filtered_batch)
+                scanned += len(batch)
+                offset += len(batch)
+                if len(batch) < request_size or self._batch_is_older_than_since(batch, plan.since_at):
+                    break
+                continue
             items.extend(batch)
             scanned += len(batch)
             offset += len(batch)
@@ -82,10 +92,33 @@ class ArxivFetcher:
         filtered = candidates
         if plan.start_year is not None:
             filtered = [item for item in filtered if item.year is not None and item.year >= plan.start_year]
+        if plan.since_at is not None:
+            filtered = self._filter_since(filtered, plan.since_at)
         filtered.sort(key=lambda item: ((item.updated_at or item.published_at or ""), item.title), reverse=True)
         if plan.recent_limit:
             filtered = filtered[: plan.recent_limit]
         return filtered
+
+    def _filter_since(self, candidates: list[PaperCandidate], since_at: str) -> list[PaperCandidate]:
+        since_dt = parse_source_datetime(since_at)
+        if since_dt is None:
+            return candidates
+        filtered: list[PaperCandidate] = []
+        for item in candidates:
+            item_dt = parse_source_datetime(item.updated_at or item.published_at)
+            if item_dt and item_dt > since_dt:
+                filtered.append(item)
+        return filtered
+
+    def _batch_is_older_than_since(self, candidates: list[PaperCandidate], since_at: str) -> bool:
+        since_dt = parse_source_datetime(since_at)
+        if since_dt is None:
+            return False
+        for item in candidates:
+            item_dt = parse_source_datetime(item.updated_at or item.published_at)
+            if item_dt and item_dt > since_dt:
+                return False
+        return True
 
     def _request_feed(self, url: str) -> str:
         last_error: Exception | None = None

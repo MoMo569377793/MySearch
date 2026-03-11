@@ -230,6 +230,7 @@ class FetchPlan:
     start_year: int | None = None
     recent_limit: int | None = None
     page_size: int = 25
+    since_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -245,3 +246,4 @@ class RunStats:
     skipped: int = 0
     by_source: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    new_paper_ids: list[int] = field(default_factory=list)

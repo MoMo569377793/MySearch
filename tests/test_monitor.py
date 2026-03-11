@@ -14,6 +14,98 @@ from paper_monitor.storage import Database
 
 
 class MonitorPipelineTest(unittest.TestCase):
+    def test_since_last_run_only_processes_new_papers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.topics = [settings.topics[0]]
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            old_candidate = PaperCandidate(
+                source_name="arxiv",
+                source_paper_id="2901.00001",
+                query_text="matrix-free finite element",
+                title="Matrix-Free FEM Baseline",
+                abstract="matrix-free finite element and partial assembly",
+                authors=["Alice"],
+                published_at="2026-03-10T09:00:00+08:00",
+                updated_at="2026-03-10T09:00:00+08:00",
+                primary_url="https://arxiv.org/abs/2901.00001",
+                pdf_url="https://arxiv.org/pdf/2901.00001.pdf",
+                doi="",
+                arxiv_id="2901.00001",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.NA"],
+                raw={"fixture": True},
+            )
+            new_candidate = PaperCandidate(
+                source_name="arxiv",
+                source_paper_id="2901.00002",
+                query_text="matrix-free finite element",
+                title="Matrix-Free FEM Incremental",
+                abstract="matrix-free finite element and multigrid",
+                authors=["Bob"],
+                published_at="2026-03-10T11:00:00+08:00",
+                updated_at="2026-03-10T11:00:00+08:00",
+                primary_url="https://arxiv.org/abs/2901.00002",
+                pdf_url="https://arxiv.org/pdf/2901.00002.pdf",
+                doi="",
+                arxiv_id="2901.00002",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.NA"],
+                raw={"fixture": True},
+            )
+
+            class FakeFetcher:
+                enabled = True
+
+                def __init__(self) -> None:
+                    self.since_values: list[str | None] = []
+
+                def fetch(self, topic, queries, plan, progress=None):  # noqa: ANN001, ARG002
+                    self.since_values.append(plan.since_at)
+                    if plan.since_at is None:
+                        return [old_candidate]
+                    return [old_candidate, new_candidate]
+
+            class DisabledFetcher:
+                enabled = False
+
+            fake_fetcher = FakeFetcher()
+            pipeline.fetchers = {
+                "arxiv": fake_fetcher,
+                "dblp": DisabledFetcher(),
+                "google_scholar_alerts": DisabledFetcher(),
+            }
+
+            first = pipeline.run_fetch(selected_sources={"arxiv"}, since_last_run=True)
+            self.assertEqual(first.stored, 1)
+            self.assertEqual(first.processed, 1)
+            self.assertEqual(len(first.new_paper_ids), 1)
+
+            checkpoint_key = "fetch:arxiv:matrix_free_fem:since"
+            checkpoint_value = db.get_checkpoint(checkpoint_key)
+            self.assertIsNotNone(checkpoint_value)
+
+            second = pipeline.run_fetch(selected_sources={"arxiv"}, since_last_run=True)
+            self.assertEqual(second.stored, 1)
+            self.assertEqual(second.processed, 1)
+            self.assertEqual(len(second.new_paper_ids), 1)
+            self.assertEqual(fake_fetcher.since_values[0], None)
+            self.assertEqual(fake_fetcher.since_values[1], checkpoint_value)
+
+            paper_count = db.connection.execute("SELECT COUNT(*) AS count FROM papers").fetchone()["count"]
+            self.assertEqual(paper_count, 2)
+            db.close()
+
     def test_topic_recent_limit_is_applied_after_cross_source_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -252,6 +344,96 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("全文状态", markdown)
             self.assertIn("llm+fulltext+metadata", markdown)
 
+            db.close()
+
+    def test_enrichment_can_filter_by_created_after(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            first = PaperCandidate(
+                source_name="arxiv",
+                source_paper_id="2910.00001",
+                query_text="FlashAttention",
+                title="Older FlashAttention Paper",
+                abstract="kernel fusion for transformer inference",
+                authors=["Alice"],
+                published_at="2026-03-10T09:00:00+08:00",
+                updated_at="2026-03-10T09:00:00+08:00",
+                primary_url="https://arxiv.org/abs/2910.00001",
+                pdf_url="https://arxiv.org/pdf/2910.00001.pdf",
+                doi="",
+                arxiv_id="2910.00001",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.LG"],
+                raw={"fixture": True},
+            )
+            second = PaperCandidate(
+                source_name="arxiv",
+                source_paper_id="2910.00002",
+                query_text="FlashAttention",
+                title="Newer FlashAttention Paper",
+                abstract="operator fusion and triton for transformer inference",
+                authors=["Bob"],
+                published_at="2026-03-10T11:00:00+08:00",
+                updated_at="2026-03-10T11:00:00+08:00",
+                primary_url="https://arxiv.org/abs/2910.00002",
+                pdf_url="https://arxiv.org/pdf/2910.00002.pdf",
+                doi="",
+                arxiv_id="2910.00002",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.LG"],
+                raw={"fixture": True},
+            )
+            pipeline._process_candidate(first, RunStats())
+            pipeline._process_candidate(second, RunStats())
+
+            db.connection.execute(
+                "UPDATE papers SET created_at = ? WHERE arxiv_id = ?",
+                ("2026-03-10T09:00:00+08:00", "2910.00001"),
+            )
+            db.connection.execute(
+                "UPDATE papers SET created_at = ? WHERE arxiv_id = ?",
+                ("2026-03-10T11:00:00+08:00", "2910.00002"),
+            )
+            db.connection.commit()
+
+            class FakeLLMClient:
+                enabled = True
+
+                def __init__(self) -> None:
+                    self.titles: list[str] = []
+
+                def generate_summary(self, paper, evaluations):  # noqa: ANN001, ARG002
+                    self.titles.append(paper.title)
+                    return LLMResult(
+                        summary_text=f"总结: {paper.title}",
+                        summary_basis="llm+abstract+metadata",
+                        tags=["flashattention"],
+                        structured={"summary": paper.title},
+                    )
+
+            fake_llm = FakeLLMClient()
+            enrichment_pipeline = EnrichmentPipeline(settings, db, llm_client=fake_llm)
+            stats = enrichment_pipeline.run(
+                limit=10,
+                created_after="2026-03-10T10:00:00+08:00",
+                use_llm=True,
+                skip_document_processing=True,
+            )
+
+            self.assertEqual(stats.enriched, 1)
+            self.assertEqual(stats.llm_summaries, 1)
+            self.assertEqual(fake_llm.titles, ["Newer FlashAttention Paper"])
             db.close()
 
     def test_enrichment_candidates_prioritize_missing_llm_summaries(self) -> None:

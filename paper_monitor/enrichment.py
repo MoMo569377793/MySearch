@@ -224,6 +224,8 @@ class EnrichmentPipeline:
         limit: int | None = None,
         topic_ids: list[str] | None = None,
         classifications: list[str] | None = None,
+        created_after: str | None = None,
+        paper_ids: list[int] | None = None,
         force: bool = False,
         use_llm: bool | None = None,
         skip_document_processing: bool = False,
@@ -238,6 +240,8 @@ class EnrichmentPipeline:
             limit=limit or self.settings.enrichment.max_papers_per_run,
             classifications=selected_classifications,
             topic_ids=topic_ids,
+            created_after=created_after,
+            paper_ids=paper_ids,
         )
         progress_bar = ProgressBar("增强", len(candidates) or 1)
         enabled_variants = [variant for variant in self.llm_variants if variant.client.enabled]

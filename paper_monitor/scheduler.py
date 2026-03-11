@@ -9,10 +9,11 @@ from paper_monitor.models import Settings
 from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.reports import generate_report
 from paper_monitor.storage import Database
-from paper_monitor.utils import today_string
+from paper_monitor.utils import now_iso, today_string
 
 
 LOGGER = logging.getLogger(__name__)
+ENRICH_CHECKPOINT_KEY = "enrich:since"
 
 
 def run_daemon(
@@ -26,6 +27,7 @@ def run_daemon(
     llm_variants: list[LLMRuntimeVariant] | None = None,
     skip_document_processing: bool = False,
     workers: int = 1,
+    since_last_run: bool = False,
 ) -> None:
     loops = 0
     runtime_variants = llm_variants or []
@@ -33,14 +35,18 @@ def run_daemon(
     while True:
         loops += 1
         LOGGER.info("starting fetch cycle %s", loops)
-        stats = pipeline.run_fetch()
+        stats = pipeline.run_fetch(since_last_run=since_last_run)
         enrichment_stats = None
         if enrich:
+            enrich_started_at = now_iso(settings.timezone) if since_last_run else None
             enrichment_stats = enrichment_pipeline.run(
+                paper_ids=stats.new_paper_ids if since_last_run else None,
                 use_llm=use_llm,
                 skip_document_processing=skip_document_processing,
                 workers=workers,
             )
+            if since_last_run and enrich_started_at is not None and not enrichment_stats.errors:
+                db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)
         report_date = today_string(settings.timezone)
         paths = generate_report(
             db,

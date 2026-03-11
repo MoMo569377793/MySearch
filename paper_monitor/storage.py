@@ -173,6 +173,30 @@ class Database:
                 continue
             self.connection.execute(ddl)
 
+    def get_checkpoint(self, key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT value FROM checkpoints WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"] or "").strip() or None
+
+    def set_checkpoint(self, key: str, value: str) -> None:
+        now = now_iso(self.timezone_name)
+        self.connection.execute(
+            """
+            INSERT INTO checkpoints (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, now),
+        )
+        self.connection.commit()
+
     def _find_existing_paper(self, candidate: PaperCandidate) -> sqlite3.Row | None:
         if candidate.doi:
             row = self.connection.execute("SELECT * FROM papers WHERE doi = ?", (candidate.doi,)).fetchone()
@@ -187,6 +211,12 @@ class Database:
             "SELECT * FROM papers WHERE title_norm = ? ORDER BY id LIMIT 1",
             (title_norm,),
         ).fetchone()
+
+    def find_existing_paper_id(self, candidate: PaperCandidate) -> int | None:
+        row = self._find_existing_paper(candidate)
+        if row is None:
+            return None
+        return int(row["id"])
 
     def upsert_paper(self, candidate: PaperCandidate) -> tuple[int, bool]:
         existing = self._find_existing_paper(candidate)
@@ -590,8 +620,12 @@ class Database:
         limit: int,
         classifications: list[str],
         topic_ids: list[str] | None = None,
+        created_after: str | None = None,
+        paper_ids: list[int] | None = None,
     ) -> list[PaperRecord]:
         if not classifications:
+            return []
+        if paper_ids is not None and not paper_ids:
             return []
         placeholders = ", ".join(["?"] * len(classifications))
         params: list[Any] = list(classifications)
@@ -600,6 +634,15 @@ class Database:
             topic_placeholders = ", ".join(["?"] * len(topic_ids))
             topic_filter = f" AND m.topic_id IN ({topic_placeholders})"
             params.extend(topic_ids)
+        created_filter = ""
+        if created_after:
+            created_filter = " AND p.created_at > ?"
+            params.append(created_after)
+        paper_filter = ""
+        if paper_ids:
+            paper_placeholders = ", ".join(["?"] * len(paper_ids))
+            paper_filter = f" AND p.id IN ({paper_placeholders})"
+            params.extend(paper_ids)
         params.append(limit)
 
         rows = self.connection.execute(
@@ -614,6 +657,8 @@ class Database:
             ) pls ON pls.paper_id = p.id
             WHERE m.classification IN ({placeholders})
             {topic_filter}
+            {created_filter}
+            {paper_filter}
             GROUP BY p.id
             ORDER BY variant_count ASC, best_score DESC, p.created_at DESC, p.id DESC
             LIMIT ?

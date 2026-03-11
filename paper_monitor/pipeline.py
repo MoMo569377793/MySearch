@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 
 from paper_monitor.fetchers.arxiv import ArxivFetcher
@@ -10,7 +11,7 @@ from paper_monitor.progress import ProgressBar
 from paper_monitor.scoring import evaluate_paper_against_topic
 from paper_monitor.storage import Database
 from paper_monitor.summarize import build_paper_summary
-from paper_monitor.utils import normalize_title
+from paper_monitor.utils import normalize_title, now_iso
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class MonitorPipeline:
         start_year: int | None = None,
         recent_limit: int | None = None,
         page_size: int | None = None,
+        since_last_run: bool = False,
     ) -> RunStats:
         stats = RunStats()
         seen_source_items: set[tuple[str, str]] = set()
@@ -41,6 +43,7 @@ class MonitorPipeline:
             recent_limit=recent_limit if recent_limit is not None else self.settings.bootstrap.recent_limit,
             page_size=page_size or self.settings.bootstrap.page_size,
         )
+        run_started_at = now_iso(self.settings.timezone)
         fetch_bar = ProgressBar("抓取", self._count_fetch_steps(selected_sources))
 
         for topic in self.settings.topics:
@@ -51,14 +54,20 @@ class MonitorPipeline:
                 fetcher = self.fetchers.get(source_name)
                 if fetcher is None or not fetcher.enabled:
                     continue
+                checkpoint_key = self._checkpoint_key(source_name, topic.id)
+                source_plan = fetch_plan
+                if since_last_run:
+                    source_plan = replace(fetch_plan, since_at=self.db.get_checkpoint(checkpoint_key))
 
                 try:
-                    candidates = fetcher.fetch(topic, queries, fetch_plan, self._make_fetch_progress(fetch_bar))
+                    candidates = fetcher.fetch(topic, queries, source_plan, self._make_fetch_progress(fetch_bar))
                 except Exception as exc:  # pragma: no cover - defensive logging
                     LOGGER.exception("fetch failed for %s / %s", topic.id, source_name)
                     fetch_bar.set_detail(f"{source_name} {topic.id} 失败: {exc}")
                     stats.errors.append(f"{source_name}:{topic.id}:{exc}")
                     continue
+                if since_last_run:
+                    self.db.set_checkpoint(checkpoint_key, run_started_at)
 
                 stats.by_source[source_name] = stats.by_source.get(source_name, 0) + len(candidates)
                 stats.fetched += len(candidates)
@@ -69,10 +78,13 @@ class MonitorPipeline:
                 if key in seen_source_items:
                     continue
                 seen_source_items.add(key)
-                self._process_candidate(candidate, stats)
+                self._process_candidate(candidate, stats, only_new=since_last_run)
 
         fetch_bar.close(f"抓取完成 {stats.fetched} 条候选")
         return stats
+
+    def _checkpoint_key(self, source_name: str, topic_id: str) -> str:
+        return f"fetch:{source_name}:{topic_id}:since"
 
     def _select_topic_candidates(self, candidates: list[PaperCandidate], fetch_plan: FetchPlan) -> list[PaperCandidate]:
         if not candidates:
@@ -136,8 +148,10 @@ class MonitorPipeline:
 
         return callback
 
-    def _process_candidate(self, candidate: PaperCandidate, stats: RunStats) -> None:
+    def _process_candidate(self, candidate: PaperCandidate, stats: RunStats, *, only_new: bool = False) -> None:
         paper_id, created = self.db.upsert_paper(candidate)
+        if only_new and not created:
+            return
         paper = self.db.get_paper(paper_id)
 
         evaluations = [evaluate_paper_against_topic(paper, topic) for topic in self.settings.topics]
@@ -166,4 +180,5 @@ class MonitorPipeline:
         stats.processed += 1
         if created:
             stats.stored += 1
+            stats.new_paper_ids.append(paper_id)
         stats.matched += saved_matches

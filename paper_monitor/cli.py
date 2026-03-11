@@ -12,10 +12,13 @@ from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.reports import generate_comparison_report, generate_report
 from paper_monitor.scheduler import run_daemon
 from paper_monitor.storage import Database
-from paper_monitor.utils import ensure_directory, today_string
+from paper_monitor.utils import ensure_directory, now_iso, today_string
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+ENRICH_CHECKPOINT_KEY = "enrich:since"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_parser.add_argument("--start-year", type=int, help="首次回填时只保留不早于该年份的论文")
     fetch_parser.add_argument("--recent-limit", type=int, help="按时间顺序保留最近多少篇论文")
     fetch_parser.add_argument("--page-size", type=int, help="单次请求分页大小")
+    fetch_parser.add_argument("--since-last-run", action="store_true", help="只处理自上次成功抓取后新增的论文")
 
     enrich_parser = subparsers.add_parser("enrich", help="下载 PDF、抽取全文并刷新摘要")
     enrich_parser.add_argument("--limit", type=int, help="本轮最多增强多少篇论文")
@@ -43,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
     enrich_parser.add_argument("--skip-pdf", action="store_true", help="跳过 PDF 下载与全文抽取，只基于标题/摘要生成总结")
     enrich_parser.add_argument("--workers", type=int, default=1, help="增强阶段并发 worker 数，默认 1")
+    enrich_parser.add_argument("--since-last-run", action="store_true", help="只增强自上次成功增强后新增入库的论文")
 
     report_parser = subparsers.add_parser("report", help="仅生成报告")
     report_parser.add_argument("--date", help="报告日期，格式 YYYY-MM-DD，默认今天")
@@ -72,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_parser.add_argument("--start-year", type=int, help="首次回填时只保留不早于该年份的论文")
     run_once_parser.add_argument("--recent-limit", type=int, help="按时间顺序保留最近多少篇论文")
     run_once_parser.add_argument("--page-size", type=int, help="单次请求分页大小")
+    run_once_parser.add_argument("--since-last-run", action="store_true", help="只处理自上次成功抓取后新增的论文")
 
     daemon_parser = subparsers.add_parser("daemon", help="持续轮询抓取，并覆盖更新当天报告")
     daemon_parser.add_argument("--type", default="daily", choices=["daily", "weekly"])
@@ -81,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
     daemon_parser.add_argument("--skip-pdf", action="store_true", help="跳过 PDF 下载与全文抽取，只基于标题/摘要生成总结")
     daemon_parser.add_argument("--workers", type=int, default=1, help="增强阶段并发 worker 数，默认 1")
+    daemon_parser.add_argument("--since-last-run", action="store_true", help="每轮仅处理自上次成功抓取后新增的论文")
 
     return parser
 
@@ -172,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                 start_year=args.start_year,
                 recent_limit=args.recent_limit,
                 page_size=args.page_size,
+                since_last_run=args.since_last_run,
             )
             print(
                 f"抓取完成: fetched={stats.fetched}, processed={stats.processed}, "
@@ -184,15 +192,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "enrich":
+            enrich_started_at = now_iso(settings.timezone) if args.since_last_run else None
             stats = enrichment_pipeline.run(
                 limit=args.limit,
                 topic_ids=args.topic,
                 classifications=args.classification,
+                created_after=db.get_checkpoint(ENRICH_CHECKPOINT_KEY) if args.since_last_run else None,
                 force=args.force,
                 use_llm=args.with_llm or None,
                 skip_document_processing=args.skip_pdf,
                 workers=args.workers,
             )
+            if args.since_last_run and enrich_started_at is not None and not stats.errors:
+                db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)
             print(
                 f"增强完成: enriched={stats.enriched}, downloaded_pdfs={stats.downloaded_pdfs}, "
                 f"extracted_texts={stats.extracted_texts}, llm_summaries={stats.llm_summaries}, skipped={stats.skipped}"
@@ -227,16 +239,21 @@ def main(argv: list[str] | None = None) -> int:
                 start_year=args.start_year,
                 recent_limit=args.recent_limit,
                 page_size=args.page_size,
+                since_last_run=args.since_last_run,
             )
             enrichment_stats = None
             if args.enrich:
+                enrich_started_at = now_iso(settings.timezone) if args.since_last_run else None
                 enrichment_stats = enrichment_pipeline.run(
                     limit=args.enrich_limit,
+                    paper_ids=stats.new_paper_ids if args.since_last_run else None,
                     force=False,
                     use_llm=args.with_llm or None,
                     skip_document_processing=args.skip_pdf,
                     workers=args.workers,
                 )
+                if args.since_last_run and enrich_started_at is not None and not enrichment_stats.errors:
+                    db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)
             report_date = args.date or today_string(settings.timezone)
             paths = generate_report(
                 db,
@@ -282,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
                 llm_variants=enabled_variants,
                 skip_document_processing=args.skip_pdf,
                 workers=args.workers,
+                since_last_run=args.since_last_run,
             )
             return 0
 

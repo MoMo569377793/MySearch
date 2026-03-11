@@ -9,7 +9,7 @@ import urllib.request
 from typing import Any, Callable
 
 from paper_monitor.models import FetchPlan, GenericSourceConfig, PaperCandidate, TopicConfig
-from paper_monitor.utils import normalize_whitespace
+from paper_monitor.utils import normalize_whitespace, parse_source_datetime
 
 
 LOGGER = logging.getLogger(__name__)
@@ -51,8 +51,10 @@ class DBLPFetcher:
             scan_cap = max(scan_cap, 300)
 
         items: list[PaperCandidate] = []
-        while scanned < scan_cap:
+        while plan.since_at is not None or scanned < scan_cap:
             request_size = min(page_size, scan_cap - scanned)
+            if plan.since_at is not None:
+                request_size = page_size
             params = urllib.parse.urlencode({"q": query, "h": request_size, "f": offset, "format": "json"})
             url = f"https://dblp.org/search/publ/api?{params}"
             payload = self._fetch_with_retry(url, query)
@@ -61,6 +63,14 @@ class DBLPFetcher:
             batch = self._parse_json(payload, query)
             if not batch:
                 break
+            if plan.since_at:
+                filtered_batch = self._filter_since(batch, plan.since_at)
+                items.extend(filtered_batch)
+                scanned += len(batch)
+                offset += len(batch)
+                if len(batch) < request_size or self._batch_is_older_than_since(batch, plan.since_at):
+                    break
+                continue
             items.extend(batch)
             scanned += len(batch)
             offset += len(batch)
@@ -72,10 +82,46 @@ class DBLPFetcher:
         filtered = candidates
         if plan.start_year is not None:
             filtered = [item for item in filtered if item.year is not None and item.year >= plan.start_year]
+        if plan.since_at is not None:
+            filtered = self._filter_since(filtered, plan.since_at)
         filtered.sort(key=lambda item: (item.year or 0, item.title), reverse=True)
         if plan.recent_limit:
             filtered = filtered[: plan.recent_limit]
         return filtered
+
+    def _filter_since(self, candidates: list[PaperCandidate], since_at: str) -> list[PaperCandidate]:
+        since_dt = parse_source_datetime(since_at)
+        if since_dt is None:
+            return candidates
+        filtered: list[PaperCandidate] = []
+        for item in candidates:
+            item_dt = parse_source_datetime(item.updated_at or item.published_at)
+            if item_dt is None:
+                filtered.append(item)
+                continue
+            if item.published_at and len(item.published_at.strip()) == 4:
+                if item_dt.year >= since_dt.year:
+                    filtered.append(item)
+                continue
+            if item_dt > since_dt:
+                filtered.append(item)
+        return filtered
+
+    def _batch_is_older_than_since(self, candidates: list[PaperCandidate], since_at: str) -> bool:
+        since_dt = parse_source_datetime(since_at)
+        if since_dt is None:
+            return False
+        for item in candidates:
+            item_dt = parse_source_datetime(item.updated_at or item.published_at)
+            if item_dt is None:
+                return False
+            if item.published_at and len(item.published_at.strip()) == 4:
+                if item_dt.year >= since_dt.year:
+                    return False
+                continue
+            if item_dt > since_dt:
+                return False
+        return True
 
     def _fetch_with_retry(self, url: str, query: str) -> str | None:
         for attempt in range(3):
