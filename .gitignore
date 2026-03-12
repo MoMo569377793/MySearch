@@ -15,3 +15,5 @@ exports/papers/*.json
 artifacts/pdfs/*
 artifacts/text/*
 *.env
+.codex.env
+.condex.env

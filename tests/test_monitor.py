@@ -17,12 +17,17 @@ from paper_monitor.scoring import evaluate_paper_against_topic
 from paper_monitor.storage import Database
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_CONFIG_IKUN = REPO_ROOT / "config" / "config-ikun.json"
+FIXTURE_CONFIG_POE = REPO_ROOT / "config" / "config-poe.json"
+
+
 class MonitorPipelineTest(unittest.TestCase):
     def test_since_last_run_only_processes_new_papers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -114,7 +119,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -182,7 +187,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -265,7 +270,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-poe.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_POE.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -314,7 +319,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -431,7 +436,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -525,7 +530,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -656,7 +661,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -776,7 +781,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -897,7 +902,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -971,7 +976,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1021,7 +1026,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1121,7 +1126,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1213,7 +1218,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1289,7 +1294,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1364,7 +1369,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1472,7 +1477,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1537,7 +1542,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
