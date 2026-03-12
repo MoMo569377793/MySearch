@@ -2,7 +2,17 @@
 说明: {description}
 论文数量: {paper_count}
 
-请总结这个主题在当前时间窗口的趋势。
-highlights 应是 2-4 条关键观察，watchlist 应是 2-4 条建议关注的论文或技术线索。
+请从“研究监控 + 工程优化情报”的角度总结这个主题在当前时间窗口的趋势。
+特别关注：
+1. 当前更偏哪些优化路线，例如 kernel fusion、compiler、Tensor Core、SVE/SME、performance portability、multigrid、partial assembly
+2. 当前更偏哪些硬件平台、框架、编译器或库
+3. 哪些论文更像工程实现突破，哪些更像理论或算法层创新
+4. 哪些论文最值得继续精读或沿引用链扩展
+
+输出要求：
+- overview：1 段中文，写清主趋势、主战场、代表性方法和明显变化
+- highlights：2-4 条，尽量写具体方法/平台/论文信号，不要空话
+- watchlist：2-4 条，尽量写值得继续跟踪的论文、框架、仓库或技术线索
+- tags：4-10 个关键词
 
 {paper_blocks}

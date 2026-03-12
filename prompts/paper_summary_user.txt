@@ -1,13 +1,30 @@
 请仅依据提供的信息进行总结，不要虚构实验结果。
-summary 需要 120-220 字中文；problem/method/application/results 用 1-2 句；contributions 和 limitations 各给 2-4 条短句数组；tags 给 3-8 个关键词。
-特别关注：
-1. 这篇论文解决了什么问题
-2. 提出了什么核心方法
-3. 主要应用在什么领域或场景
-4. 给出了什么关键结果、证据或实验结论
-5. 如果本次请求直接附带 PDF 文件，请以 PDF 全文为准，basis 输出 llm+pdf+metadata
-6. 如果本次请求提供的是完整抽取全文文本，basis 输出 llm+fulltext+metadata
-7. 如果本次只能看到摘要和元数据，basis 输出 llm+abstract+metadata
+summary 需要 160-260 字中文；problem/method/application/results 用 1-2 句；contributions 和 limitations 各给 2-4 条短句数组；tags 给 4-10 个关键词。
+
+请按“研究监控 + 工程落地”视角总结，特别关注下面信息，并尽量映射到现有字段里：
+1. problem:
+   - 明确论文要优化或解决的核心瓶颈
+   - 如果是算子/内核/求解器优化，写清目标对象，例如 GEMM、attention、matrix-free operator application、preconditioner、multigrid
+   - 如果论文更偏数学分析而不是实现优化，请明确写出这一点
+2. method:
+   - 明确核心方法
+   - 如果有优化技术，请优先写出 kernel fusion、tiling、scheduling、vectorization、Tensor Core、SVE/SME、CUDA/HIP、performance portability、partial assembly、sum factorization 等具体手段
+   - 如果有框架或软件栈，请写出 CUTLASS、Triton、MLIR、XLA、libCEED、MFEM、deal.II 等
+3. application:
+   - 明确适用场景、任务、领域、硬件平台或软件生态
+   - 如果能看出是训练、推理、GPU、ARM、多核 CPU、集群/HPC，请写清楚
+4. results:
+   - 优先写定量结果，例如 speedup、吞吐、延迟、显存/内存、可扩展性、roofline、strong/weak scaling
+   - 如果论文没有给出明确数字，也要明确说明“未给出清晰定量结果”
+5. contributions:
+   - 优先写工程贡献、性能贡献、实现贡献、平台适配贡献
+6. limitations:
+   - 优先写适用范围、依赖特定硬件/框架、实验覆盖不足、缺少真实部署结果、主要偏理论等限制
+7. tags:
+   - 尽量包含算子名、硬件名、指令集、框架名、编译器名、方法名
+8. 如果本次请求直接附带 PDF 文件，请以 PDF 全文为准，basis 输出 llm+pdf+metadata
+9. 如果本次请求提供的是完整抽取全文文本，basis 输出 llm+fulltext+metadata
+10. 如果本次只能看到摘要和元数据，basis 输出 llm+abstract+metadata
 
 标题: {title}
 作者: {authors}
