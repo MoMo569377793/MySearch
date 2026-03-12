@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import html
 import json
 import logging
@@ -63,6 +64,7 @@ def _single_runtime_variant(settings: Settings, llm_client: LLMClient) -> LLMRun
 def _collect_topic_digests_by_variant(
     settings: Settings,
     grouped_entries: dict[str, list[ReportEntry]],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
     variants: list[LLMRuntimeVariant | dict],
     use_llm_topic_digest: bool,
     progress_callback=None,
@@ -78,10 +80,19 @@ def _collect_topic_digests_by_variant(
         topic_digests: dict[str, dict] = {}
         for topic in settings.topics:
             topic_entries = grouped_entries.get(topic.id, [])
+            prepared_entries, digest_input_meta = _prepare_digest_entries_for_variant(
+                topic_entries,
+                paper_summaries_by_paper,
+                variant_id=variant_id,
+                entry_limit=getattr(client.config, "topic_digest_entry_limit", settings.llm.topic_digest_entry_limit)
+                if hasattr(client, "config")
+                else settings.llm.topic_digest_entry_limit,
+                variant_label=str(_variant_attr(variant, "label") or variant_id),
+            )
             if progress_callback:
                 progress_callback(f"{_variant_attr(variant, 'label')} -> {topic.display_name}", True)
             try:
-                digest = client.generate_topic_digest(topic.display_name, topic.description, topic_entries)
+                digest = client.generate_topic_digest(topic.display_name, topic.description, prepared_entries)
             except Exception as exc:  # pragma: no cover - defensive for flaky upstream APIs
                 LOGGER.warning("topic digest failed for %s / %s: %s", variant_id, topic.id, exc)
                 if progress_callback:
@@ -97,11 +108,72 @@ def _collect_topic_digests_by_variant(
                 "watchlist": digest.watchlist,
                 "tags": digest.tags,
                 "usage": digest.structured.get("usage", {}),
+                "input_meta": digest_input_meta,
             }
             if progress_callback:
                 progress_callback(f"{_variant_attr(variant, 'label')} -> {topic.display_name} 完成", False)
         digests_by_variant[variant_id] = topic_digests
     return digests_by_variant
+
+
+def _prepare_digest_entries_for_variant(
+    entries: list[ReportEntry],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    *,
+    variant_id: str,
+    entry_limit: int,
+    variant_label: str,
+) -> tuple[list[ReportEntry], dict[str, object]]:
+    selected_entries = entries[: max(int(entry_limit or 0), 0)] if entry_limit else list(entries)
+    prepared_entries: list[ReportEntry] = []
+    input_papers: list[dict[str, object]] = []
+    used_variant_count = 0
+    fallback_count = 0
+    for entry in selected_entries:
+        summaries = paper_summaries_by_paper.get(entry.paper.id, [])
+        selected_summary = next((item for item in summaries if item.variant_id == variant_id), None)
+        if selected_summary is not None:
+            used_variant_count += 1
+            summary_text = selected_summary.summary_text or entry.paper.summary_text or entry.paper.abstract or "无"
+            summary_basis = selected_summary.summary_basis or entry.paper.summary_basis
+            source_label = f"{variant_label} 单篇总结"
+            scope_label = _summary_scope_label(selected_summary)
+            scope_note = _summary_scope_note(selected_summary)
+        else:
+            fallback_count += 1
+            summary_text = entry.paper.summary_text or entry.paper.abstract or "无"
+            summary_basis = entry.paper.summary_basis
+            source_label = "默认总结"
+            scope_label = "默认总结"
+            scope_note = "未找到该模型的逐篇总结，已回退到默认总结。"
+        prepared_entries.append(
+            replace(
+                entry,
+                paper=replace(
+                    entry.paper,
+                    summary_text=summary_text,
+                    summary_basis=summary_basis,
+                ),
+            )
+        )
+        input_papers.append(
+            {
+                "paper_id": entry.paper.id,
+                "title": entry.paper.title,
+                "published_at": entry.paper.published_at,
+                "summary_source": source_label,
+                "summary_scope": scope_label,
+                "summary_scope_note": scope_note,
+            }
+        )
+    return prepared_entries, {
+        "available_entry_count": len(entries),
+        "selected_entry_count": len(selected_entries),
+        "selection_mode": "all" if len(selected_entries) == len(entries) else f"top_{len(selected_entries)}",
+        "variant_summary_count": used_variant_count,
+        "fallback_summary_count": fallback_count,
+        "input_papers": input_papers,
+    }
 
 
 def _render_summary_lines(variants: list[LLMRuntimeVariant | dict], summaries: list[PaperLLMSummary]) -> list[str]:
@@ -175,6 +247,60 @@ def _render_summary_html(variants: list[LLMRuntimeVariant | dict], summaries: li
     return '<div class="llm-summary-grid">' + "".join(items) + "</div>"
 
 
+def _digest_input_meta_lines(digest: dict) -> list[str]:
+    input_meta = digest.get("input_meta", {}) if isinstance(digest, dict) else {}
+    if not isinstance(input_meta, dict) or not input_meta:
+        return []
+    selected = input_meta.get("selected_entry_count", 0)
+    available = input_meta.get("available_entry_count", 0)
+    selection_mode = str(input_meta.get("selection_mode", "")).strip() or "unknown"
+    variant_summary_count = input_meta.get("variant_summary_count", 0)
+    fallback_summary_count = input_meta.get("fallback_summary_count", 0)
+    input_papers = input_meta.get("input_papers", []) if isinstance(input_meta.get("input_papers"), list) else []
+    preview = " | ".join(
+        f"#{item.get('paper_id')} {item.get('title')} [{item.get('summary_source')}/{item.get('summary_scope')}]"
+        for item in input_papers[:5]
+        if isinstance(item, dict)
+    )
+    lines = [
+        f"- 聚合输入：使用 `{selected}/{available}` 篇论文（`{selection_mode}`）",
+        f"- 逐篇总结来源：本模型总结 `{variant_summary_count}` 篇，回退默认总结 `{fallback_summary_count}` 篇",
+    ]
+    if preview:
+        suffix = " | ..." if len(input_papers) > 5 else ""
+        lines.append(f"- 输入论文：`{preview}{suffix}`")
+    return lines
+
+
+def _digest_input_meta_html(digest: dict) -> str:
+    input_meta = digest.get("input_meta", {}) if isinstance(digest, dict) else {}
+    if not isinstance(input_meta, dict) or not input_meta:
+        return ""
+    selected = input_meta.get("selected_entry_count", 0)
+    available = input_meta.get("available_entry_count", 0)
+    selection_mode = str(input_meta.get("selection_mode", "")).strip() or "unknown"
+    variant_summary_count = input_meta.get("variant_summary_count", 0)
+    fallback_summary_count = input_meta.get("fallback_summary_count", 0)
+    input_papers = input_meta.get("input_papers", []) if isinstance(input_meta.get("input_papers"), list) else []
+    preview = " | ".join(
+        f"#{item.get('paper_id')} {item.get('title')} [{item.get('summary_source')}/{item.get('summary_scope')}]"
+        for item in input_papers[:5]
+        if isinstance(item, dict)
+    )
+    preview_html = (
+        f"<p><strong>输入论文：</strong>{html.escape(preview)}{' | ...' if len(input_papers) > 5 else ''}</p>"
+        if preview
+        else ""
+    )
+    return (
+        f"<p><strong>聚合输入：</strong>{html.escape(str(selected))}/{html.escape(str(available))} 篇"
+        f"（{html.escape(selection_mode)}）</p>"
+        f"<p><strong>逐篇总结来源：</strong>本模型总结 {html.escape(str(variant_summary_count))} 篇，"
+        f"回退默认总结 {html.escape(str(fallback_summary_count))} 篇</p>"
+        f"{preview_html}"
+    )
+
+
 def _summary_scope_label(summary: PaperLLMSummary) -> str:
     structured = summary.structured if isinstance(summary.structured, dict) else {}
     source_mode = str(structured.get("source_mode", "")).strip().lower()
@@ -191,16 +317,50 @@ def _summary_scope_note(summary: PaperLLMSummary) -> str:
     source_mode = str(structured.get("source_mode", "")).strip().lower()
     chunk_count = structured.get("chunk_count")
     pdf_filename = str(structured.get("pdf_filename", "")).strip()
+    pdf_strategy = str(
+        structured.get("pdf_input_strategy") or structured.get("direct_pdf_strategy") or ""
+    ).strip()
+    direct_pdf_status = str(structured.get("direct_pdf_status", "")).strip().lower()
     if source_mode == "pdf_direct":
+        strategy_text = f"直接 PDF 输入（策略 `{pdf_strategy}`）" if pdf_strategy else "直接 PDF 输入"
         if pdf_filename:
-            return f"本次总结由模型直接读取 PDF 文件 {pdf_filename} 后生成，没有经过本地文字节选回退。"
-        return "本次总结由模型直接读取 PDF 文件后生成，没有经过本地文字节选回退。"
+            return f"本次总结由模型通过 {strategy_text} 读取 PDF 文件 {pdf_filename} 后生成，没有经过本地文字节选回退。"
+        return f"本次总结由模型通过 {strategy_text} 读取 PDF 文件后生成，没有经过本地文字节选回退。"
     if source_mode == "fulltext_txt":
+        fallback_text = ""
+        if direct_pdf_status == "unsupported":
+            fallback_text = (
+                f" 直接 PDF 探测未通过{f'（已尝试 `{pdf_strategy}`）' if pdf_strategy else ''}，"
+                "因此回退到全文文本模式。"
+            )
+        elif direct_pdf_status == "request_failed":
+            fallback_text = (
+                f" 直接 PDF 请求失败{f'（策略 `{pdf_strategy}`）' if pdf_strategy else ''}，"
+                "因此回退到全文文本模式。"
+            )
+        elif direct_pdf_status == "disabled":
+            fallback_text = " 当前配置已禁用直接 PDF 输入，因此回退到全文文本模式。"
+        elif direct_pdf_status == "no_local_pdf":
+            fallback_text = " 当前没有可用本地 PDF，因此直接使用抽取后的全文文本。"
         if chunk_count:
-            return f"本次总结读取了完整 PDF 提取全文，并按 {chunk_count} 个分块进行分析后聚合。"
-        return "本次总结读取了完整 PDF 提取全文后再进行聚合分析。"
+            return f"本次总结读取了完整 PDF 提取全文，并按 {chunk_count} 个分块进行分析后聚合。{fallback_text}".strip()
+        return f"本次总结读取了完整 PDF 提取全文后再进行聚合分析。{fallback_text}".strip()
     if (summary.summary_basis or "").strip().lower() == "llm+fulltext+metadata":
         return "本次总结包含全文信息。"
+    if direct_pdf_status == "unsupported":
+        return (
+            f"本次总结没有读取完整全文，只基于标题、摘要和元数据。"
+            f" 直接 PDF 探测未通过{f'（已尝试 `{pdf_strategy}`）' if pdf_strategy else ''}。"
+        ).strip()
+    if direct_pdf_status == "request_failed":
+        return (
+            f"本次总结没有读取完整全文，只基于标题、摘要和元数据。"
+            f" 直接 PDF 请求失败{f'（策略 `{pdf_strategy}`）' if pdf_strategy else ''}。"
+        ).strip()
+    if direct_pdf_status == "disabled":
+        return "本次总结没有读取完整全文，只基于标题、摘要和元数据。当前配置已禁用直接 PDF 输入。"
+    if direct_pdf_status == "no_local_pdf":
+        return "本次总结没有读取完整全文，只基于标题、摘要和元数据。当前没有可用本地 PDF。"
     return "本次总结没有读取完整全文，只基于标题、摘要和元数据。"
 
 
@@ -517,6 +677,26 @@ def generate_paper_reports(
                         "summary_basis": summary.summary_basis,
                         "summary_scope": _summary_scope_label(summary),
                         "summary_scope_note": _summary_scope_note(summary),
+                        "source_mode": (
+                            summary.structured.get("source_mode", "")
+                            if isinstance(summary.structured, dict)
+                            else ""
+                        ),
+                        "pdf_input_strategy": (
+                            summary.structured.get("pdf_input_strategy", "")
+                            if isinstance(summary.structured, dict)
+                            else ""
+                        ),
+                        "direct_pdf_strategy": (
+                            summary.structured.get("direct_pdf_strategy", "")
+                            if isinstance(summary.structured, dict)
+                            else ""
+                        ),
+                        "direct_pdf_status": (
+                            summary.structured.get("direct_pdf_status", "")
+                            if isinstance(summary.structured, dict)
+                            else ""
+                        ),
                         "structured": summary.structured,
                         "usage": summary.usage,
                     }
@@ -596,6 +776,8 @@ def _render_markdown(
                 lines.append(f"- {variant.label} 主题概览：未生成")
                 continue
             lines.append(f"- {variant.label} 主题概览：{digest.get('overview', '')}")
+            for meta_line in _digest_input_meta_lines(digest):
+                lines.append(f"- {variant.label} {meta_line[2:]}" if meta_line.startswith("- ") else f"- {variant.label} {meta_line}")
             highlights = digest.get("highlights", [])
             if highlights:
                 lines.append(f"- {variant.label} 关键观察：`{' | '.join(highlights[:3])}`")
@@ -671,6 +853,7 @@ def _render_html(
                 <article class="topic-digest-card">
                   <p class="meta">模型 {html.escape(variant.label)}</p>
                   <p><strong>主题概览：</strong>{html.escape(digest.get('overview', '未生成'))}</p>
+                  {_digest_input_meta_html(digest)}
                   {f"<p><strong>关键观察：</strong>{html.escape(' | '.join(digest.get('highlights', [])[:3]))}</p>" if digest.get('highlights') else ''}
                   {f"<p><strong>建议关注：</strong>{html.escape(' | '.join(digest.get('watchlist', [])[:3]))}</p>" if digest.get('watchlist') else ''}
                 </article>
@@ -886,6 +1069,7 @@ def _render_comparison_markdown(
             lines.append(f"- 基础地址：`{variant['base_url']}`")
             if digest:
                 lines.append(f"- LLM 主题概览：{digest.get('overview', '')}")
+                lines.extend(_digest_input_meta_lines(digest))
                 highlights = digest.get("highlights", [])
                 if highlights:
                     lines.append(f"- LLM 关键观察：`{' | '.join(highlights[:3])}`")
@@ -929,6 +1113,7 @@ def _render_comparison_html(
                   <p class="meta">模型 {html.escape(variant['model'])}</p>
                   <p class="meta">Base URL {html.escape(variant['base_url'])}</p>
                   <p><strong>LLM 主题概览：</strong>{html.escape(digest.get('overview', '未生成'))}</p>
+                  {_digest_input_meta_html(digest)}
                   {f"<p><strong>LLM 关键观察：</strong>{html.escape(' | '.join(digest.get('highlights', [])[:3]))}</p>" if digest.get('highlights') else ''}
                   {f"<p><strong>LLM 建议关注：</strong>{html.escape(' | '.join(digest.get('watchlist', [])[:3]))}</p>" if digest.get('watchlist') else ''}
                 </article>
@@ -1058,6 +1243,7 @@ def generate_report(
     topic_digests_by_variant = _collect_topic_digests_by_variant(
         settings,
         grouped_entries,
+        paper_summaries_by_paper,
         report_variants,
         use_llm_topic_digest,
         progress_callback=lambda detail, advance: (
@@ -1145,6 +1331,21 @@ def generate_report(
                                         if isinstance(summary.structured, dict)
                                         else ""
                                     ),
+                                    "pdf_input_strategy": (
+                                        summary.structured.get("pdf_input_strategy", "")
+                                        if isinstance(summary.structured, dict)
+                                        else ""
+                                    ),
+                                    "direct_pdf_strategy": (
+                                        summary.structured.get("direct_pdf_strategy", "")
+                                        if isinstance(summary.structured, dict)
+                                        else ""
+                                    ),
+                                    "direct_pdf_status": (
+                                        summary.structured.get("direct_pdf_status", "")
+                                        if isinstance(summary.structured, dict)
+                                        else ""
+                                    ),
                                     "chunk_count": (
                                         summary.structured.get("chunk_count")
                                         if isinstance(summary.structured, dict)
@@ -1217,10 +1418,12 @@ def generate_comparison_report(
     grouped_entries: dict[str, list[ReportEntry]] = defaultdict(list)
     for entry in entries:
         grouped_entries[entry.topic_id].append(entry)
+    paper_summaries_by_paper = db.fetch_paper_llm_summaries([entry.paper.id for entry in entries])
 
     digests_by_variant = _collect_topic_digests_by_variant(
         settings,
         grouped_entries,
+        paper_summaries_by_paper,
         variants,
         True,
         progress_callback=lambda detail, advance: (

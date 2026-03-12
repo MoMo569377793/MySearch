@@ -20,11 +20,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 ENRICH_CHECKPOINT_KEY = "enrich:since"
+DEFAULT_RUNTIME_CONFIG = "config/config-poe.json"
+DEFAULT_INIT_CONFIG = "config/config.example.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="本地论文监控工具")
-    parser.add_argument("--config", default="config/config.json", help="配置文件路径")
+    parser.add_argument("--config", default=DEFAULT_RUNTIME_CONFIG, help="配置文件路径")
     parser.add_argument("--log-level", default="INFO", help="日志级别，默认 INFO")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -68,8 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--date", help="报告日期，格式 YYYY-MM-DD，默认今天")
     compare_parser.add_argument("--type", default="weekly", choices=["daily", "weekly"])
     compare_parser.add_argument("--days", type=int, help="统计窗口天数，默认使用左侧配置中的 report.lookback_days")
-    compare_parser.add_argument("--left-config", default="config/config.json", help="左侧配置文件路径")
-    compare_parser.add_argument("--right-config", default="config/config.example.json", help="右侧配置文件路径")
+    compare_parser.add_argument("--left-config", default="config/config-poe.json", help="左侧配置文件路径")
+    compare_parser.add_argument("--right-config", default="config/config-ikun.json", help="右侧配置文件路径")
 
     run_once_parser = subparsers.add_parser("run-once", help="抓取后立即生成报告")
     run_once_parser.add_argument("--date", help="报告日期，格式 YYYY-MM-DD，默认今天")
@@ -125,7 +127,10 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level)
 
     if args.command == "init":
-        config_path = write_default_config(args.config, force=args.force)
+        config_target = args.config
+        if config_target == DEFAULT_RUNTIME_CONFIG:
+            config_target = DEFAULT_INIT_CONFIG
+        config_path = write_default_config(config_target, force=args.force)
         settings = load_settings(config_path)
         ensure_directory(settings.report_dir)
         ensure_directory(settings.export_dir)

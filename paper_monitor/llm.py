@@ -59,12 +59,46 @@ class LLMClient:
         fulltext = ""
         pdf_path = self._resolve_local_pdf_path(paper)
         pdf_strategy = self._ensure_pdf_input_strategy(pdf_path)
+        direct_pdf_status = ""
         if pdf_path and pdf_strategy:
             parsed, usage = self._generate_summary_from_pdf(paper, evaluations, pdf_path, pdf_strategy)
+            if parsed:
+                LOGGER.info(
+                    "llm summary route: paper_id=%s model=%s source_mode=pdf_direct strategy=%s",
+                    paper.id,
+                    self.config.label or self.config.model or self.config.variant_id,
+                    pdf_strategy,
+                )
+            else:
+                direct_pdf_status = "request_failed"
+                LOGGER.warning(
+                    "llm direct pdf summary failed for paper_id=%s model=%s via %s, fallback to extracted text",
+                    paper.id,
+                    self.config.label or self.config.model or self.config.variant_id,
+                    pdf_strategy,
+                )
+        elif pdf_path:
+            direct_pdf_status = "unsupported"
+            LOGGER.warning(
+                "llm direct pdf unavailable for paper_id=%s model=%s, fallback to extracted text",
+                paper.id,
+                self.config.label or self.config.model or self.config.variant_id,
+            )
+        elif self.config.pdf_input_mode.strip().lower() == "disable":
+            direct_pdf_status = "disabled"
+        else:
+            direct_pdf_status = "no_local_pdf"
         fulltext = self._load_fulltext_text(paper)
         if fulltext:
             if not parsed:
                 parsed, usage = self._generate_summary_from_fulltext(paper, evaluations, fulltext)
+                if parsed:
+                    LOGGER.info(
+                        "llm summary route: paper_id=%s model=%s source_mode=fulltext_txt direct_pdf_status=%s",
+                        paper.id,
+                        self.config.label or self.config.model or self.config.variant_id,
+                        direct_pdf_status or "not_attempted",
+                    )
         if not parsed:
             prefer_compact = self._prefers_compact_mode()
             if prefer_compact:
@@ -78,6 +112,12 @@ class LLMClient:
                     schema=self._paper_summary_schema(),
                     max_output_tokens=max(self.config.max_output_tokens, 1200),
                 )
+                if parsed:
+                    LOGGER.info(
+                        "llm summary route: paper_id=%s model=%s source_mode=abstract_metadata",
+                        paper.id,
+                        self.config.label or self.config.model or self.config.variant_id,
+                    )
             if not parsed:
                 parsed, usage = self._request_structured_json(
                     system_prompt=self._paper_summary_system_prompt(),
@@ -85,6 +125,12 @@ class LLMClient:
                     schema_name="paper_summary",
                     schema=self._paper_summary_schema(),
                 )
+                if parsed:
+                    LOGGER.info(
+                        "llm summary route: paper_id=%s model=%s source_mode=abstract_metadata",
+                        paper.id,
+                        self.config.label or self.config.model or self.config.variant_id,
+                    )
             if not parsed and not prefer_compact:
                 parsed, usage = self._request_structured_json(
                     system_prompt=(
@@ -96,8 +142,27 @@ class LLMClient:
                     schema=self._paper_summary_schema(),
                     max_output_tokens=max(self.config.max_output_tokens, 1200),
                 )
+                if parsed:
+                    LOGGER.info(
+                        "llm summary route: paper_id=%s model=%s source_mode=abstract_metadata",
+                        paper.id,
+                        self.config.label or self.config.model or self.config.variant_id,
+                    )
         if not parsed:
             return None
+
+        source_mode = str(parsed.get("source_mode", "")).strip().lower()
+        if not source_mode:
+            parsed["source_mode"] = "abstract_metadata"
+        if pdf_path:
+            parsed.setdefault("pdf_filename", pdf_path.name)
+        if pdf_strategy:
+            if parsed.get("source_mode") == "pdf_direct":
+                parsed.setdefault("pdf_input_strategy", pdf_strategy)
+            else:
+                parsed.setdefault("direct_pdf_strategy", pdf_strategy)
+        if direct_pdf_status and parsed.get("source_mode") != "pdf_direct":
+            parsed.setdefault("direct_pdf_status", direct_pdf_status)
 
         parsed["usage"] = usage
         tags = unique_strings(parsed.get("tags", []))
@@ -781,6 +846,8 @@ class LLMClient:
         parsed["source_mode"] = "pdf_direct"
         parsed["pdf_input_used"] = True
         parsed["pdf_filename"] = pdf_path.name
+        parsed["pdf_input_strategy"] = pdf_strategy
+        parsed["direct_pdf_status"] = "used"
         return parsed, self._merge_usage_items(usage_items)
 
     def _load_fulltext_text(self, paper: PaperRecord) -> str:

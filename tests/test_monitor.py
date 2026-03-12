@@ -20,7 +20,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -112,7 +112,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -180,7 +180,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -263,7 +263,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -380,7 +380,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -474,7 +474,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -605,7 +605,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -718,13 +718,14 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(result.summary_basis, "llm+pdf+metadata")
             self.assertEqual(result.structured.get("source_mode"), "pdf_direct")
             self.assertTrue(result.structured.get("pdf_input_used"))
+            self.assertEqual(result.structured.get("pdf_input_strategy"), "chat_file")
             self.assertGreaterEqual(client.pdf_request_count, 2)
 
     def test_llm_summary_falls_back_to_fulltext_when_pdf_direct_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -837,6 +838,7 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result.summary_basis, "llm+fulltext+metadata")
             self.assertEqual(result.structured.get("source_mode"), "fulltext_txt")
+            self.assertEqual(result.structured.get("direct_pdf_status"), "unsupported")
             self.assertGreaterEqual(client.pdf_probe_attempts, 1)
             self.assertGreaterEqual(client.chunk_calls, 1)
 
@@ -844,7 +846,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -918,7 +920,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -968,7 +970,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -998,18 +1000,41 @@ class MonitorPipelineTest(unittest.TestCase):
                 ),
                 RunStats(),
             )
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id=settings.llm.variant_id,
+                variant_label=settings.llm.label,
+                provider=settings.llm.provider,
+                base_url=settings.llm.base_url,
+                model=settings.llm.model,
+                summary_text="这是 gpt-5.4 自己的逐篇总结。",
+                summary_basis="llm+pdf+metadata",
+                tags=["flashattention"],
+                structured={
+                    "summary": "这是 gpt-5.4 自己的逐篇总结。",
+                    "basis": "llm+pdf+metadata",
+                    "source_mode": "pdf_direct",
+                    "pdf_input_strategy": "chat_file",
+                    "direct_pdf_status": "used",
+                },
+                usage={"input_tokens": 100, "output_tokens": 30, "total_tokens": 130},
+            )
 
             class FakeTopicDigestClient:
                 enabled = True
 
+                def __init__(self) -> None:
+                    self.seen_summary_text = ""
+
                 def generate_topic_digest(self, topic_name, description, entries):  # noqa: ANN001
                     if topic_name != "AI 算子加速":
                         return None
+                    self.seen_summary_text = entries[0].paper.summary_text
                     return type(
                         "Digest",
                         (),
                         {
-                            "overview": "本窗口主题主要集中在 attention kernel 与 kernel fusion。",
+                            "overview": f"本窗口主题主要集中在 attention kernel 与 kernel fusion。输入摘要={self.seen_summary_text}",
                             "highlights": ["FlashAttention 仍然是主线", "Triton 和 MLIR 协同增多"],
                             "watchlist": ["关注训练侧 kernel autotuning"],
                             "tags": ["flashattention", "kernel fusion"],
@@ -1017,19 +1042,27 @@ class MonitorPipelineTest(unittest.TestCase):
                         },
                     )()
 
+            fake_client = FakeTopicDigestClient()
             paths = generate_report(
                 db,
                 settings,
                 report_date="2026-03-10",
                 report_type="daily",
                 lookback_days=1,
-                llm_client=FakeTopicDigestClient(),
+                llm_client=fake_client,
                 use_llm_topic_digest=True,
             )
             markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+            export = Path(paths["json"]).read_text(encoding="utf-8")
+            self.assertEqual(fake_client.seen_summary_text, "这是 gpt-5.4 自己的逐篇总结。")
             self.assertIn("gpt-5.4 主题概览", markdown)
             self.assertIn("attention kernel 与 kernel fusion", markdown)
+            self.assertIn("输入摘要=这是 gpt-5.4 自己的逐篇总结。", markdown)
+            self.assertIn("gpt-5.4 聚合输入：使用 `1/1` 篇论文", markdown)
+            self.assertIn("gpt-5.4 逐篇总结来源：本模型总结 `1` 篇，回退默认总结 `0` 篇", markdown)
             self.assertIn("gpt-5.4 Token", markdown)
+            self.assertIn("\"variant_summary_count\": 1", export)
+            self.assertIn("\"summary_source\": \"ikun_gpt-5.4 单篇总结\"", export)
 
             db.close()
 
@@ -1037,7 +1070,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1092,6 +1125,8 @@ class MonitorPipelineTest(unittest.TestCase):
                     "basis": "llm+fulltext+metadata",
                     "source_mode": "fulltext_txt",
                     "chunk_count": 4,
+                    "direct_pdf_status": "unsupported",
+                    "direct_pdf_strategy": "chat_file",
                 },
                 usage={"input_tokens": 1234, "output_tokens": 222, "total_tokens": 1456},
             )
@@ -1113,9 +1148,11 @@ class MonitorPipelineTest(unittest.TestCase):
 
             self.assertIn("输入依据：`已读取完整全文`", markdown)
             self.assertIn("本次总结读取了完整 PDF 提取全文，并按 4 个分块进行分析后聚合。", markdown)
+            self.assertIn("直接 PDF 探测未通过（已尝试 `chat_file`）", markdown)
             self.assertIn("问题：高阶 FEM 的矩阵自由算子与预条件效率问题。", markdown)
             self.assertIn("方法：matrix-free + multigrid + partial assembly。", markdown)
             self.assertIn("输入依据 已读取完整全文", html)
+            self.assertIn("\"direct_pdf_status\": \"unsupported\"", export)
             self.assertIn("\"summary_scope\": \"已读取完整全文\"", export)
             self.assertIn("\"chunk_count\": 4", export)
 
@@ -1125,7 +1162,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1176,6 +1213,7 @@ class MonitorPipelineTest(unittest.TestCase):
                     "basis": "llm+pdf+metadata",
                     "source_mode": "pdf_direct",
                     "pdf_filename": "2761.00001.pdf",
+                    "pdf_input_strategy": "chat_file",
                 },
                 usage={"input_tokens": 321, "output_tokens": 88, "total_tokens": 409},
             )
@@ -1188,8 +1226,10 @@ class MonitorPipelineTest(unittest.TestCase):
 
             self.assertIn("单篇论文总结 - Standalone Paper Report Test", markdown)
             self.assertIn("输入依据：`已直接读取 PDF`", markdown)
+            self.assertIn("策略 `chat_file`", markdown)
             self.assertIn("这是单篇导出的模型总结。", markdown)
             self.assertIn("已直接读取 PDF", html)
+            self.assertIn("chat_file", export)
             self.assertIn("\"summary_scope\": \"已直接读取 PDF\"", export)
 
             db.close()
@@ -1198,7 +1238,7 @@ class MonitorPipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
-            source_config = Path("/home/momo/git_ws/search/config/config.example.json").read_text(encoding="utf-8")
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
             (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
 
             settings = load_settings(root / "config" / "config.json")
@@ -1272,14 +1312,14 @@ class MonitorPipelineTest(unittest.TestCase):
                 variants=[
                     {
                         "slug": "config",
-                        "label": "config.json",
+                        "label": "config-ikun.json",
                         "model": "gpt-5",
                         "base_url": "https://left.example/v1",
                         "llm_client": FakeDigestClientA(),
                     },
                     {
-                        "slug": "config-example",
-                        "label": "config.example.json",
+                        "slug": "config-poe",
+                        "label": "config-poe.json",
                         "model": "gpt-5.4",
                         "base_url": "https://right.example/v1",
                         "llm_client": FakeDigestClientB(),
@@ -1288,8 +1328,8 @@ class MonitorPipelineTest(unittest.TestCase):
                 lookback_days=7,
             )
             markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            self.assertIn("config.json", markdown)
-            self.assertIn("config.example.json", markdown)
+            self.assertIn("config-ikun.json", markdown)
+            self.assertIn("config-poe.json", markdown)
             self.assertIn("A:有限元分析 Matrix-Free 算法优化", markdown)
             self.assertIn("B:有限元分析 Matrix-Free 算法优化", markdown)
             self.assertIn("gpt-5.4", markdown)

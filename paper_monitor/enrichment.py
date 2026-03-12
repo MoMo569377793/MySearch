@@ -32,6 +32,22 @@ STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
 TEXT_LITERAL_RE = re.compile(r"\(([^()]*)\)")
 
 
+def _llm_route_label(llm_result) -> str:  # noqa: ANN001
+    structured = llm_result.structured if isinstance(getattr(llm_result, "structured", None), dict) else {}
+    source_mode = str(structured.get("source_mode", "")).strip().lower()
+    pdf_strategy = str(
+        structured.get("pdf_input_strategy") or structured.get("direct_pdf_strategy") or ""
+    ).strip()
+    direct_pdf_status = str(structured.get("direct_pdf_status", "")).strip().lower()
+    if source_mode == "pdf_direct":
+        return f"PDF/{pdf_strategy or 'direct'}"
+    if source_mode == "fulltext_txt":
+        if direct_pdf_status in {"unsupported", "request_failed", "disabled", "no_local_pdf"}:
+            return f"全文回退/{direct_pdf_status}"
+        return "全文"
+    return "摘要"
+
+
 @dataclass(slots=True)
 class DocumentArtifacts:
     pdf_local_path: str
@@ -499,6 +515,8 @@ class EnrichmentPipeline:
                 llm_result = variant.client.generate_summary(paper, evaluations)
                 if llm_result is None:
                     continue
+                if progress_bar:
+                    progress_bar.set_detail(f"{title} -> {variant.label} [{_llm_route_label(llm_result)}]")
                 llm_results.append((variant, llm_result))
 
         if not llm_results and progress_bar:
