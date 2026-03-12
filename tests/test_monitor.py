@@ -9,9 +9,10 @@ from paper_monitor.config import load_settings
 from paper_monitor.enrichment import DocumentArtifacts, EnrichmentPipeline
 from paper_monitor.llm import LLMClient
 from paper_monitor.models import FetchPlan, LLMResult
-from paper_monitor.models import PaperCandidate, PaperRecord, RunStats
+from paper_monitor.models import PaperCandidate, PaperRecord, RunStats, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
-from paper_monitor.reports import generate_comparison_report, generate_paper_reports, generate_report
+from paper_monitor.reports import generate_catalog_report, generate_comparison_report, generate_paper_reports, generate_report
+from paper_monitor.scoring import evaluate_paper_against_topic
 from paper_monitor.storage import Database
 
 
@@ -258,6 +259,55 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("AI 算子加速", html)
 
             db.close()
+
+    def test_ai_operator_priority_categories_and_venues_raise_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = Path("/home/momo/git_ws/search/config/config-poe.json").read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            topic = next(topic for topic in settings.topics if topic.id == "ai_operator_acceleration")
+            paper = PaperRecord(
+                id=1,
+                title="Tensor Core GEMM Optimization for Transformer Inference on GPUs",
+                title_norm="tensor core gemm optimization for transformer inference on gpus",
+                abstract="We optimize GEMM and matrix multiplication kernels for transformer inference with Tensor Core acceleration.",
+                authors=["Alice"],
+                published_at="2026-03-10",
+                updated_at="2026-03-10",
+                primary_url="https://example.com/paper",
+                pdf_url="https://example.com/paper.pdf",
+                doi="",
+                arxiv_id="2905.00001",
+                venue="MLSys",
+                year=2026,
+                categories=["cs.DC", "cs.AR"],
+                summary_text="",
+                summary_basis="metadata-only",
+                tags=[],
+                pdf_local_path="",
+                pdf_status="pending",
+                pdf_downloaded_at=None,
+                fulltext_txt_path="",
+                fulltext_excerpt="",
+                fulltext_status="empty",
+                page_count=None,
+                llm_summary={},
+                analysis_updated_at=None,
+                source_first="arxiv",
+                created_at="2026-03-10T09:00:00+08:00",
+                last_seen_at="2026-03-10T09:00:00+08:00",
+                metadata={},
+            )
+
+            evaluation = evaluate_paper_against_topic(paper, topic)
+            self.assertEqual(evaluation.classification, "relevant")
+            self.assertTrue(any("优先 arXiv 分类" in reason for reason in evaluation.reasons))
+            self.assertTrue(any("优先 venue 线索" in reason for reason in evaluation.reasons))
+            self.assertIn("cs.DC", evaluation.matched_keywords)
+            self.assertIn("mlsys", evaluation.matched_keywords)
 
     def test_enrichment_pipeline_upgrades_summary_with_fulltext_and_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1231,6 +1281,146 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("已直接读取 PDF", html)
             self.assertIn("chat_file", export)
             self.assertIn("\"summary_scope\": \"已直接读取 PDF\"", export)
+
+            db.close()
+
+    def test_generate_catalog_report_lists_stored_model_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2903.00001",
+                    query_text="matrix-free finite element",
+                    title="Matrix-Free Preconditioners for High-Order FEM",
+                    abstract="matrix-free finite element preconditioner and multigrid",
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2903.00001",
+                    pdf_url="https://arxiv.org/pdf/2903.00001.pdf",
+                    doi="",
+                    arxiv_id="2903.00001",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.NA"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id="poe",
+                variant_label="poe_gemini-3.1-pro",
+                provider="openai_compatible",
+                base_url="https://api.poe.com/v1",
+                model="gemini-3.1-pro",
+                summary_text="Poe 总结",
+                summary_basis="llm+fulltext+metadata",
+                tags=["matrix-free"],
+                structured={"summary": "Poe 总结", "source_mode": "fulltext_txt"},
+                usage={},
+            )
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id="ikun",
+                variant_label="ikun_gpt-5.4",
+                provider="IkunCoding",
+                base_url="https://api.ikuncode.cc/v1",
+                model="gpt-5.4",
+                summary_text="Ikun 总结",
+                summary_basis="llm+pdf+metadata",
+                tags=["matrix-free"],
+                structured={"summary": "Ikun 总结", "source_mode": "pdf_direct", "pdf_input_strategy": "chat_file"},
+                usage={},
+            )
+
+            paths = generate_catalog_report(db, settings)
+            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+            export = Path(paths["json"]).read_text(encoding="utf-8")
+
+            self.assertIn("论文库总览", markdown)
+            self.assertIn("Matrix-Free Preconditioners for High-Order FEM", markdown)
+            self.assertIn("poe_gemini-3.1-pro", markdown)
+            self.assertIn("ikun_gpt-5.4", markdown)
+            self.assertIn("Poe 总结", markdown)
+            self.assertIn("Ikun 总结", markdown)
+            self.assertIn("\"variant_id\": \"poe\"", export)
+            self.assertIn("\"variant_id\": \"ikun\"", export)
+
+            db.close()
+
+    def test_delete_paper_cascades_related_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = Path("/home/momo/git_ws/search/config/config-ikun.json").read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+
+            candidate = PaperCandidate(
+                source_name="manual",
+                source_paper_id="manual-1",
+                query_text="manual",
+                title="Manual GPU Kernel Paper",
+                abstract="kernel fusion compiler",
+                authors=["Bob"],
+                published_at="2026-03-10",
+                updated_at="2026-03-10",
+                primary_url="https://example.com/paper",
+                pdf_url="https://example.com/paper.pdf",
+                doi="10.1000/manual",
+                arxiv_id="",
+                venue="manual",
+                year=2026,
+                categories=["cs.LG"],
+                raw={"fixture": True},
+            )
+            paper_id, created = db.upsert_paper(candidate)
+            self.assertTrue(created)
+            db.upsert_match(
+                paper_id,
+                TopicEvaluation(
+                    topic_id="ai_operator_acceleration",
+                    topic_name="AI 算子加速",
+                    score=100.0,
+                    classification="relevant",
+                    matched_keywords=["manual"],
+                    reasons=["用户手动加入论文"],
+                ),
+            )
+            db.upsert_paper_llm_summary(
+                paper_id,
+                variant_id="poe",
+                variant_label="poe_gemini-3.1-pro",
+                provider="openai_compatible",
+                base_url="https://api.poe.com/v1",
+                model="gemini-3.1-pro",
+                summary_text="manual summary",
+                summary_basis="llm+abstract+metadata",
+                tags=["manual"],
+                structured={"summary": "manual summary"},
+                usage={},
+            )
+
+            self.assertTrue(db.delete_paper(paper_id))
+            self.assertFalse(db.delete_paper(paper_id))
+            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0], 0)
+            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM paper_sources").fetchone()[0], 0)
+            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM matches").fetchone()[0], 0)
+            self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM paper_llm_summaries").fetchone()[0], 0)
 
             db.close()
 

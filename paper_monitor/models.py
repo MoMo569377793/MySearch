@@ -15,7 +15,9 @@ class TopicConfig:
     positive_keywords: list[str] = field(default_factory=list)
     exclude_keywords: list[str] = field(default_factory=list)
     arxiv_categories: list[str] = field(default_factory=list)
+    priority_arxiv_categories: list[str] = field(default_factory=list)
     dblp_venue_keywords: list[str] = field(default_factory=list)
+    priority_venue_keywords: list[str] = field(default_factory=list)
     threshold: float = 18.0
 
 

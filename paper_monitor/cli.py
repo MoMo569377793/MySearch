@@ -8,12 +8,18 @@ from paper_monitor.config import load_settings, write_default_config
 from paper_monitor.enrichment import EnrichmentPipeline
 from paper_monitor.llm import LLMClient
 from paper_monitor.llm_registry import build_runtime_variants
+from paper_monitor.models import PaperCandidate, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.progress import ProgressBar
-from paper_monitor.reports import generate_comparison_report, generate_paper_reports, generate_report
+from paper_monitor.reports import (
+    generate_catalog_report,
+    generate_comparison_report,
+    generate_paper_reports,
+    generate_report,
+)
 from paper_monitor.scheduler import run_daemon
 from paper_monitor.storage import Database
-from paper_monitor.utils import ensure_directory, now_iso, to_day_bounds, today_string
+from paper_monitor.utils import ensure_directory, now_iso, stable_hash, to_day_bounds, today_string
 
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
     enrich_parser.add_argument("--skip-pdf", action="store_true", help="跳过 PDF 下载与全文抽取，只基于标题/摘要生成总结")
     enrich_parser.add_argument("--workers", type=int, default=1, help="增强阶段并发 worker 数，默认 1")
+    enrich_parser.add_argument("--paper-id", type=int, action="append", help="仅增强指定一个或多个 paper_id")
     enrich_parser.add_argument("--since-last-run", action="store_true", help="只增强自上次成功增强后新增入库的论文")
 
     report_parser = subparsers.add_parser("report", help="仅生成报告")
@@ -65,6 +72,31 @@ def build_parser() -> argparse.ArgumentParser:
     paper_report_parser.add_argument("--type", default="daily", choices=["daily", "weekly"])
     paper_report_parser.add_argument("--days", type=int, help="统计窗口天数，默认使用配置中的 report.lookback_days")
     paper_report_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+
+    catalog_parser = subparsers.add_parser("catalog-report", help="按当前数据库生成全库总览报告")
+    catalog_parser.add_argument("--topic", action="append", help="仅导出指定 topic id")
+    catalog_parser.add_argument("--classification", action="append", choices=["relevant", "maybe"])
+    catalog_parser.add_argument("--with-llm", action="store_true", help="若已配置 LLM，则生成领域级聚合概览")
+    catalog_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+
+    paper_add_parser = subparsers.add_parser("paper-add", help="手动向数据库添加一篇论文并绑定到一个或多个领域")
+    paper_add_parser.add_argument("--topic", action="append", required=True, help="目标 topic id，可重复传入")
+    paper_add_parser.add_argument("--title", required=True, help="论文标题")
+    paper_add_parser.add_argument("--abstract", default="", help="论文摘要")
+    paper_add_parser.add_argument("--author", action="append", help="作者，可重复传入")
+    paper_add_parser.add_argument("--published-at", help="发布时间，支持 YYYY-MM-DD 或 ISO 时间")
+    paper_add_parser.add_argument("--updated-at", help="更新时间，支持 YYYY-MM-DD 或 ISO 时间")
+    paper_add_parser.add_argument("--primary-url", default="", help="论文主页或详情链接")
+    paper_add_parser.add_argument("--pdf-url", default="", help="PDF 下载链接")
+    paper_add_parser.add_argument("--doi", default="", help="DOI")
+    paper_add_parser.add_argument("--arxiv-id", default="", help="arXiv ID")
+    paper_add_parser.add_argument("--venue", default="", help="期刊 / 会议 / 来源名称")
+    paper_add_parser.add_argument("--year", type=int, help="年份")
+    paper_add_parser.add_argument("--category", action="append", help="分类标签，可重复传入")
+    paper_add_parser.add_argument("--classification", default="relevant", choices=["relevant", "maybe"])
+
+    paper_delete_parser = subparsers.add_parser("paper-delete", help="按 paper_id 从数据库删除论文")
+    paper_delete_parser.add_argument("--paper-id", type=int, action="append", required=True, help="一个或多个 paper_id")
 
     compare_parser = subparsers.add_parser("compare-report", help="使用两套配置生成并排对比报告")
     compare_parser.add_argument("--date", help="报告日期，格式 YYYY-MM-DD，默认今天")
@@ -119,6 +151,14 @@ def _open_database(config_path: str) -> tuple[Database, MonitorPipeline]:
     db = Database(settings.database_path, settings.timezone)
     db.initialize()
     return db, MonitorPipeline(settings, db)
+
+
+def _select_topics(settings, topic_ids: list[str]):  # noqa: ANN001
+    topic_map = {topic.id: topic for topic in settings.topics}
+    missing = [topic_id for topic_id in topic_ids if topic_id not in topic_map]
+    if missing:
+        raise ValueError(f"未知 topic id: {', '.join(missing)}")
+    return [topic_map[topic_id] for topic_id in topic_ids]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -185,6 +225,60 @@ def main(argv: list[str] | None = None) -> int:
             "检测到 --with-llm，但当前没有可用的 LLM 变体。请检查 API key 环境变量和额外配置。"
         )
     try:
+        if args.command == "paper-add":
+            topics = _select_topics(settings, args.topic)
+            source_key = args.primary_url or args.pdf_url or args.doi or args.arxiv_id or args.title
+            source_paper_id = f"manual-{stable_hash(source_key)}"
+            candidate = PaperCandidate(
+                source_name="manual",
+                source_paper_id=source_paper_id,
+                query_text="manual",
+                title=args.title,
+                abstract=args.abstract or "",
+                authors=args.author or [],
+                published_at=args.published_at,
+                updated_at=args.updated_at,
+                primary_url=args.primary_url or args.pdf_url or "",
+                pdf_url=args.pdf_url or "",
+                doi=args.doi or "",
+                arxiv_id=args.arxiv_id or "",
+                venue=args.venue or "manual",
+                year=args.year,
+                categories=args.category or [],
+                raw={"manual": True, "added_via": "paper-add"},
+            )
+            paper_id, created = db.upsert_paper(candidate)
+            for topic in topics:
+                db.upsert_match(
+                    paper_id,
+                    TopicEvaluation(
+                        topic_id=topic.id,
+                        topic_name=topic.display_name,
+                        score=max(float(topic.threshold), 100.0),
+                        classification=args.classification,
+                        matched_keywords=["manual"],
+                        reasons=["用户手动加入论文"],
+                    ),
+                )
+            print(f"论文已写入数据库: paper_id={paper_id}, {'新建' if created else '更新'}")
+            print(f"所属领域: {', '.join(topic.display_name for topic in topics)}")
+            return 0
+
+        if args.command == "paper-delete":
+            deleted = 0
+            missing: list[int] = []
+            for paper_id in list(dict.fromkeys(args.paper_id)):
+                if db.delete_paper(paper_id):
+                    deleted += 1
+                else:
+                    missing.append(paper_id)
+            print(f"删除完成: deleted={deleted}")
+            if missing:
+                print("未找到的 paper_id:")
+                for item in missing:
+                    print(f"- {item}")
+            return 0
+
         if args.command == "fetch":
             selected_sources = set(args.source or [])
             stats = pipeline.run_fetch(
@@ -213,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
                 topic_ids=args.topic,
                 classifications=args.classification,
                 created_after=db.get_checkpoint(ENRICH_CHECKPOINT_KEY) if args.since_last_run else None,
+                paper_ids=args.paper_id,
                 force=args.force,
                 use_llm=args.with_llm or None,
                 skip_document_processing=args.skip_pdf,
@@ -243,6 +338,21 @@ def main(argv: list[str] | None = None) -> int:
                 use_llm_topic_digest=args.with_llm,
             )
             print(f"报告已生成: {paths['markdown']}")
+            print(f"HTML: {paths['html']}")
+            print(f"JSON: {paths['json']}")
+            print(f"单篇报告目录: {paths['papers_dir']}")
+            return 0
+
+        if args.command == "catalog-report":
+            paths = generate_catalog_report(
+                db,
+                settings,
+                topic_ids=args.topic,
+                classifications=args.classification,
+                llm_variants=enabled_variants,
+                use_llm_topic_digest=args.with_llm,
+            )
+            print(f"总览报告已生成: {paths['markdown']}")
             print(f"HTML: {paths['html']}")
             print(f"JSON: {paths['json']}")
             print(f"单篇报告目录: {paths['papers_dir']}")

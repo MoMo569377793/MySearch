@@ -639,6 +639,81 @@ class Database:
                 source_urls.append(source_url)
         return source_names, source_urls
 
+    def delete_paper(self, paper_id: int) -> bool:
+        cursor = self.connection.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def fetch_catalog_entries(
+        self,
+        *,
+        include_maybe: bool,
+        topic_ids: list[str] | None = None,
+        classifications: list[str] | None = None,
+        paper_ids: list[int] | None = None,
+    ) -> list[ReportEntry]:
+        effective_classifications = tuple(classifications or (("relevant", "maybe") if include_maybe else ("relevant",)))
+        if not effective_classifications:
+            return []
+        placeholders = ", ".join(["?"] * len(effective_classifications))
+        params: list[Any] = list(effective_classifications)
+
+        topic_filter = ""
+        if topic_ids:
+            topic_placeholders = ", ".join(["?"] * len(topic_ids))
+            topic_filter = f" AND m.topic_id IN ({topic_placeholders})"
+            params.extend(topic_ids)
+
+        paper_filter = ""
+        if paper_ids:
+            paper_placeholders = ", ".join(["?"] * len(paper_ids))
+            paper_filter = f" AND p.id IN ({paper_placeholders})"
+            params.extend(paper_ids)
+
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                m.topic_id,
+                m.topic_name,
+                m.score,
+                m.classification,
+                m.matched_keywords_json,
+                m.reasons_json,
+                p.*,
+                GROUP_CONCAT(DISTINCT ps.source_name) AS source_names_csv,
+                GROUP_CONCAT(DISTINCT ps.source_url) AS source_urls_csv
+            FROM matches m
+            JOIN papers p ON p.id = m.paper_id
+            LEFT JOIN paper_sources ps ON ps.paper_id = p.id
+            WHERE m.classification IN ({placeholders})
+            {topic_filter}
+            {paper_filter}
+            GROUP BY m.id
+            ORDER BY m.topic_name ASC, COALESCE(NULLIF(p.published_at, ''), p.created_at) DESC, p.id DESC
+            """,
+            params,
+        ).fetchall()
+
+        entries: list[ReportEntry] = []
+        for row in rows:
+            paper = self._row_to_paper(row)
+            source_names = [name for name in (row["source_names_csv"] or "").split(",") if name]
+            source_urls = [url for url in (row["source_urls_csv"] or "").split(",") if url]
+            entries.append(
+                ReportEntry(
+                    topic_id=row["topic_id"],
+                    topic_name=row["topic_name"],
+                    score=float(row["score"]),
+                    classification=row["classification"],
+                    matched_keywords=safe_json_loads(row["matched_keywords_json"], []),
+                    reasons=safe_json_loads(row["reasons_json"], []),
+                    paper=paper,
+                    source_names=source_names,
+                    source_urls=source_urls,
+                )
+            )
+        return entries
+
     def fetch_enrichment_candidates(
         self,
         limit: int,

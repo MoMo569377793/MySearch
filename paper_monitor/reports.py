@@ -12,7 +12,7 @@ from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import PaperLLMSummary, PaperRecord, ReportEntry, Settings, TopicEvaluation
 from paper_monitor.progress import ProgressBar
 from paper_monitor.storage import Database
-from paper_monitor.utils import ensure_directory, shorten, to_day_bounds
+from paper_monitor.utils import ensure_directory, now_iso, shorten, to_day_bounds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -47,6 +47,15 @@ def _topic_trend_sentence(entries: list[ReportEntry]) -> str:
     if top_tags:
         return f"本时间窗口新增 {len(entries)} 篇候选论文，主要集中在 {', '.join(top_tags)}。"
     return f"本时间窗口新增 {len(entries)} 篇候选论文，主题分布较分散。"
+
+
+def _catalog_topic_sentence(entries: list[ReportEntry]) -> str:
+    if not entries:
+        return "当前数据库中该领域还没有论文。"
+    top_tags = _top_tags(entries)
+    if top_tags:
+        return f"当前数据库中共有 {len(entries)} 篇论文，常见关键词包括 {', '.join(top_tags)}。"
+    return f"当前数据库中共有 {len(entries)} 篇论文。"
 
 
 def _single_runtime_variant(settings: Settings, llm_client: LLMClient) -> LLMRuntimeVariant:
@@ -435,6 +444,28 @@ def _variants_for_paper(
     ]
 
 
+def _merge_variants_with_stored_summaries(
+    variants: list[LLMRuntimeVariant | dict],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+) -> list[LLMRuntimeVariant | dict]:
+    merged: list[LLMRuntimeVariant | dict] = list(variants)
+    seen = {str(_variant_attr(variant, "variant_id") or "") for variant in merged}
+    for paper_id in sorted(paper_summaries_by_paper):
+        for summary in paper_summaries_by_paper.get(paper_id, []):
+            if summary.variant_id in seen:
+                continue
+            merged.append(
+                {
+                    "variant_id": summary.variant_id,
+                    "label": summary.variant_label or summary.model or summary.variant_id,
+                    "model": summary.model,
+                    "base_url": summary.base_url,
+                }
+            )
+            seen.add(summary.variant_id)
+    return merged
+
+
 def _render_paper_topics(evaluations: list[TopicEvaluation]) -> list[str]:
     if not evaluations:
         return ["- 主题匹配：无"]
@@ -630,7 +661,10 @@ def generate_paper_reports(
         evaluations = db.fetch_paper_evaluations(paper_id)
         source_names, source_urls = db.fetch_paper_sources(paper_id)
         summaries = summaries_by_paper.get(paper_id, [])
-        variants = _variants_for_paper(summaries, llm_variants)
+        variants = _merge_variants_with_stored_summaries(
+            _variants_for_paper(summaries, llm_variants),
+            {paper_id: summaries},
+        )
         stem = _paper_report_stem(paper)
         if progress_bar:
             progress_bar.set_detail(f"单篇导出 {shorten(paper.title, 52)}")
@@ -1028,6 +1062,405 @@ def _render_html(
 """
 
 
+def _render_catalog_markdown(
+    generated_at: str,
+    grouped_entries: dict[str, list[ReportEntry]],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    topic_digests_by_variant: dict[str, dict[str, dict]],
+    variants: list[LLMRuntimeVariant],
+    settings: Settings,
+) -> str:
+    total = sum(len(items) for items in grouped_entries.values())
+    unique_paper_ids = {entry.paper.id for items in grouped_entries.values() for entry in items}
+    lines = [
+        f"# 论文库总览 - {generated_at[:19]}",
+        "",
+        f"- 生成时间：`{generated_at}`",
+        f"- 主题数量：`{len(settings.topics)}`",
+        f"- 领域命中文章数：`{total}`",
+        f"- 去重后论文数：`{len(unique_paper_ids)}`",
+        f"- LLM 模型数：`{len(variants)}`",
+        "",
+    ]
+
+    for topic in settings.topics:
+        entries = grouped_entries.get(topic.id, [])
+        lines.append(f"## {topic.display_name}")
+        lines.append("")
+        lines.append(topic.description)
+        lines.append("")
+        lines.append(f"- 当前论文数：`{len(entries)}`")
+        lines.append(f"- 总览：{_catalog_topic_sentence(entries)}")
+        for variant in variants:
+            variant_id = str(_variant_attr(variant, "variant_id") or "")
+            variant_label = str(_variant_attr(variant, "label") or variant_id or "未知模型")
+            digest = topic_digests_by_variant.get(variant_id, {}).get(topic.id)
+            if not digest:
+                lines.append(f"- {variant_label} 领域概览：未生成")
+                continue
+            lines.append(f"- {variant_label} 领域概览：{digest.get('overview', '')}")
+            for meta_line in _digest_input_meta_lines(digest):
+                lines.append(f"- {variant_label} {meta_line[2:]}" if meta_line.startswith("- ") else f"- {variant_label} {meta_line}")
+            highlights = digest.get("highlights", [])
+            if highlights:
+                lines.append(f"- {variant_label} 关键观察：`{' | '.join(highlights[:3])}`")
+            watchlist = digest.get("watchlist", [])
+            if watchlist:
+                lines.append(f"- {variant_label} 建议关注：`{' | '.join(watchlist[:3])}`")
+        lines.append("")
+
+        if not entries:
+            lines.append("当前没有已入库论文。")
+            lines.append("")
+            continue
+
+        for index, entry in enumerate(entries, start=1):
+            paper = entry.paper
+            lines.append(f"### {index}. {paper.title}")
+            lines.append("")
+            lines.append(f"- paper_id：`{paper.id}`")
+            lines.append(f"- 相关性：`{entry.classification}` / 分数 `{entry.score}`")
+            lines.append(f"- 发布时间：`{paper.published_at or '未知'}` / 最近入库：`{paper.created_at}`")
+            lines.append(f"- 来源：`{', '.join(entry.source_names) or paper.source_first}`")
+            lines.append(f"- Venue / 分类：`{paper.venue or '未知'}` / `{', '.join(paper.categories) or '无'}`")
+            lines.append(
+                f"- 全文状态：`{paper.fulltext_status}` / PDF `{paper.pdf_status}` / "
+                f"页数 `{paper.page_count or '未知'}` / 默认总结来源 `{paper.summary_basis or '未知'}`"
+            )
+            lines.append(f"- 匹配词：`{', '.join(entry.matched_keywords) or '无'}`")
+            lines.append(f"- 链接：{paper.primary_url or (entry.source_urls[0] if entry.source_urls else '无')}")
+            lines.append(f"- 默认总结：{paper.summary_text or '无'}")
+            lines.append("#### 多模型摘要")
+            lines.extend(_render_summary_lines(variants, paper_summaries_by_paper.get(paper.id, [])))
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _render_catalog_html(
+    generated_at: str,
+    grouped_entries: dict[str, list[ReportEntry]],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    topic_digests_by_variant: dict[str, dict[str, dict]],
+    variants: list[LLMRuntimeVariant],
+    settings: Settings,
+) -> str:
+    total = sum(len(items) for items in grouped_entries.values())
+    unique_paper_ids = {entry.paper.id for items in grouped_entries.values() for entry in items}
+    sections: list[str] = []
+    for topic in settings.topics:
+        entries = grouped_entries.get(topic.id, [])
+        digest_cards: list[str] = []
+        for variant in variants:
+            variant_id = str(_variant_attr(variant, "variant_id") or "")
+            variant_label = str(_variant_attr(variant, "label") or variant_id or "未知模型")
+            digest = topic_digests_by_variant.get(variant_id, {}).get(topic.id, {})
+            digest_cards.append(
+                f"""
+                <article class="topic-digest-card">
+                  <p class="meta">模型 {html.escape(variant_label)}</p>
+                  <p><strong>领域概览：</strong>{html.escape(digest.get('overview', '未生成'))}</p>
+                  {_digest_input_meta_html(digest)}
+                  {f"<p><strong>关键观察：</strong>{html.escape(' | '.join(digest.get('highlights', [])[:3]))}</p>" if digest.get('highlights') else ''}
+                  {f"<p><strong>建议关注：</strong>{html.escape(' | '.join(digest.get('watchlist', [])[:3]))}</p>" if digest.get('watchlist') else ''}
+                </article>
+                """
+            )
+        cards: list[str] = []
+        for entry in entries:
+            paper = entry.paper
+            cards.append(
+                f"""
+                <article class="paper-card">
+                  <h3>{html.escape(paper.title)}</h3>
+                  <p class="meta">paper_id {paper.id} / 相关性 {entry.classification} / 分数 {entry.score}</p>
+                  <p class="meta">发布时间 {html.escape(paper.published_at or '未知')} / 最近入库 {html.escape(paper.created_at)}</p>
+                  <p class="meta">来源 {html.escape(', '.join(entry.source_names) or paper.source_first)} / Venue {html.escape(paper.venue or '未知')}</p>
+                  <p class="meta">全文状态 {html.escape(paper.fulltext_status)} / PDF {html.escape(paper.pdf_status)} / 页数 {html.escape(str(paper.page_count or '未知'))}</p>
+                  <div class="paper-grid">
+                    <div class="paper-panel">
+                      <p><strong>匹配词：</strong>{html.escape(', '.join(entry.matched_keywords) or '无')}</p>
+                      <p><strong>默认总结：</strong>{html.escape(paper.summary_text or '无')}</p>
+                    </div>
+                    <div class="paper-panel">
+                      <p><strong>链接：</strong><a href="{html.escape(paper.primary_url or (entry.source_urls[0] if entry.source_urls else '#'))}">原始链接</a></p>
+                      <p><strong>分类：</strong>{html.escape(', '.join(paper.categories) or '无')}</p>
+                    </div>
+                  </div>
+                  <div class="llm-summary-section">
+                    <p><strong>多模型摘要：</strong></p>
+                    {_render_summary_html(variants, paper_summaries_by_paper.get(paper.id, []))}
+                  </div>
+                </article>
+                """
+            )
+        if not cards:
+            cards.append('<article class="paper-card"><p>当前没有已入库论文。</p></article>')
+        sections.append(
+            f"""
+            <section class="topic-section">
+              <div class="topic-header">
+                <h2>{html.escape(topic.display_name)}</h2>
+                <p>{html.escape(topic.description)}</p>
+                <p class="trend">{html.escape(_catalog_topic_sentence(entries))}</p>
+              </div>
+              <div class="topic-digest-grid">
+                {''.join(digest_cards)}
+              </div>
+              {''.join(cards)}
+            </section>
+            """
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文库总览</title>
+  <style>
+    :root {{
+      --bg: #f3efe7;
+      --panel: #fffdf8;
+      --ink: #18222d;
+      --muted: #52606d;
+      --accent: #0a7d6f;
+      --border: #d7d0c3;
+    }}
+    body {{
+      margin: 0;
+      font-family: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(10, 125, 111, 0.14), transparent 28%),
+        linear-gradient(180deg, #f9f5ed 0%, var(--bg) 100%);
+      line-height: 1.6;
+    }}
+    main {{
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }}
+    header {{
+      margin-bottom: 28px;
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: rgba(255, 253, 248, 0.86);
+      backdrop-filter: blur(8px);
+    }}
+    h1, h2, h3 {{
+      font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+      margin: 0 0 12px;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 0.96rem;
+    }}
+    .topic-section {{
+      margin-top: 28px;
+    }}
+    .topic-header {{
+      margin-bottom: 14px;
+    }}
+    .trend {{
+      color: var(--accent);
+      font-weight: 600;
+    }}
+    .topic-digest-grid {{
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin-bottom: 16px;
+    }}
+    .topic-digest-card {{
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255, 253, 248, 0.92);
+    }}
+    .paper-card {{
+      padding: 18px 18px 14px;
+      margin-bottom: 16px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 12px 30px rgba(24, 34, 45, 0.06);
+    }}
+    .paper-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      margin: 12px 0;
+    }}
+    .paper-panel {{
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(243, 239, 231, 0.45);
+    }}
+    .llm-summary-section {{
+      margin-top: 12px;
+    }}
+    .llm-summary-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      margin-top: 8px;
+    }}
+    .llm-summary-card {{
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: rgba(255, 253, 248, 0.94);
+    }}
+    a {{
+      color: var(--accent);
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>论文库总览</h1>
+      <p class="meta">生成时间 {html.escape(generated_at)}</p>
+      <p class="meta">领域命中文章数 {total} / 去重后论文数 {len(unique_paper_ids)} / LLM 模型数 {len(variants)}</p>
+    </header>
+    {''.join(sections)}
+  </main>
+</body>
+</html>
+"""
+
+
+def generate_catalog_report(
+    db: Database,
+    settings: Settings,
+    *,
+    topic_ids: list[str] | None = None,
+    classifications: list[str] | None = None,
+    llm_variants: list[LLMRuntimeVariant] | None = None,
+    use_llm_topic_digest: bool = False,
+) -> dict[str, str]:
+    report_variants = list(llm_variants or [])
+    digest_steps = _active_variant_count(report_variants) * len(settings.topics) if use_llm_topic_digest else 0
+    progress_bar = ProgressBar("论文库总览", 6 + digest_steps)
+    progress_bar.advance(detail="加载数据库论文")
+    entries = db.fetch_catalog_entries(
+        include_maybe=settings.report.include_maybe,
+        topic_ids=topic_ids,
+        classifications=classifications,
+    )
+    grouped_entries: dict[str, list[ReportEntry]] = defaultdict(list)
+    for entry in entries:
+        grouped_entries[entry.topic_id].append(entry)
+
+    progress_bar.advance(detail="读取逐篇 LLM 摘要")
+    paper_summaries_by_paper = db.fetch_paper_llm_summaries([entry.paper.id for entry in entries])
+    display_variants = _merge_variants_with_stored_summaries(report_variants, paper_summaries_by_paper)
+    topic_digests_by_variant = _collect_topic_digests_by_variant(
+        settings,
+        grouped_entries,
+        paper_summaries_by_paper,
+        report_variants,
+        use_llm_topic_digest,
+        progress_callback=lambda detail, advance: (
+            progress_bar.advance(detail=detail) if advance else progress_bar.set_detail(detail)
+        ),
+    )
+
+    progress_bar.advance(detail="导出单篇论文报告")
+    paper_report_outputs = generate_paper_reports(
+        db,
+        settings,
+        [entry.paper.id for entry in entries],
+        llm_variants=display_variants,
+    )
+
+    generated_at = now_iso(settings.timezone)
+    report_root = settings.report_dir / "catalog"
+    ensure_directory(report_root)
+    ensure_directory(settings.export_dir)
+
+    progress_bar.advance(detail="渲染 Markdown")
+    markdown_text = _render_catalog_markdown(
+        generated_at,
+        grouped_entries,
+        paper_summaries_by_paper,
+        topic_digests_by_variant,
+        display_variants,
+        settings,
+    )
+    progress_bar.advance(detail="渲染 HTML")
+    html_text = _render_catalog_html(
+        generated_at,
+        grouped_entries,
+        paper_summaries_by_paper,
+        topic_digests_by_variant,
+        display_variants,
+        settings,
+    )
+    progress_bar.advance(detail="导出 JSON 与写入文件")
+    json_text = json.dumps(
+        {
+            "generated_at": generated_at,
+            "variants": _serialize_variants(display_variants),
+            "topic_digests": topic_digests_by_variant,
+            "topics": {
+                topic.id: [
+                    {
+                        "topic_name": entry.topic_name,
+                        "score": entry.score,
+                        "classification": entry.classification,
+                        "matched_keywords": entry.matched_keywords,
+                        "paper": {
+                            "id": entry.paper.id,
+                            "title": entry.paper.title,
+                            "published_at": entry.paper.published_at,
+                            "created_at": entry.paper.created_at,
+                            "primary_url": entry.paper.primary_url,
+                            "summary_text": entry.paper.summary_text,
+                            "summary_basis": entry.paper.summary_basis,
+                            "paper_report": paper_report_outputs.get(entry.paper.id, {}),
+                            "llm_summaries": [
+                                {
+                                    "variant_id": summary.variant_id,
+                                    "variant_label": summary.variant_label,
+                                    "model": summary.model,
+                                    "summary_text": summary.summary_text,
+                                    "summary_basis": summary.summary_basis,
+                                    "summary_scope": _summary_scope_label(summary),
+                                    "summary_scope_note": _summary_scope_note(summary),
+                                    "structured": summary.structured,
+                                }
+                                for summary in paper_summaries_by_paper.get(entry.paper.id, [])
+                            ],
+                        },
+                    }
+                    for entry in grouped_entries.get(topic.id, [])
+                ]
+                for topic in settings.topics
+            },
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    path_md = report_root / "current.md"
+    path_html = report_root / "current.html"
+    path_json = settings.export_dir / "catalog-current.json"
+    path_md.write_text(markdown_text, encoding="utf-8")
+    path_html.write_text(html_text, encoding="utf-8")
+    path_json.write_text(json_text + "\n", encoding="utf-8")
+    progress_bar.close("论文库总览已生成")
+    return {
+        "markdown": str(path_md),
+        "html": str(path_html),
+        "json": str(path_json),
+        "papers_dir": str(settings.report_dir / "papers"),
+    }
+
+
 def _render_comparison_markdown(
     report_type: str,
     report_date: str,
@@ -1240,6 +1673,7 @@ def generate_report(
 
     progress_bar.advance(detail="读取逐篇 LLM 摘要")
     paper_summaries_by_paper = db.fetch_paper_llm_summaries([entry.paper.id for entry in entries])
+    display_variants = _merge_variants_with_stored_summaries(report_variants, paper_summaries_by_paper)
     topic_digests_by_variant = _collect_topic_digests_by_variant(
         settings,
         grouped_entries,
@@ -1260,7 +1694,7 @@ def generate_report(
         db,
         settings,
         [entry.paper.id for entry in entries],
-        llm_variants=report_variants,
+        llm_variants=display_variants,
     )
 
     progress_bar.advance(detail="渲染 Markdown")
@@ -1272,7 +1706,7 @@ def generate_report(
         grouped_entries,
         paper_summaries_by_paper,
         topic_digests_by_variant,
-        report_variants,
+        display_variants,
         settings,
     )
     progress_bar.advance(detail="渲染 HTML")
@@ -1284,7 +1718,7 @@ def generate_report(
         grouped_entries,
         paper_summaries_by_paper,
         topic_digests_by_variant,
-        report_variants,
+        display_variants,
         settings,
     )
     progress_bar.advance(detail="导出 JSON 与写入文件")
@@ -1294,7 +1728,7 @@ def generate_report(
             "report_date": report_date,
             "start_at": start_at,
             "end_at": end_at,
-            "variants": _serialize_variants(report_variants),
+            "variants": _serialize_variants(display_variants),
             "topic_digests": topic_digests_by_variant,
             "topics": {
                 topic_id: [
@@ -1388,7 +1822,7 @@ def generate_report(
             "topic_digests": {
                 variant_id: list(items.keys()) for variant_id, items in topic_digests_by_variant.items()
             },
-            "variants": _serialize_variants(report_variants),
+            "variants": _serialize_variants(display_variants),
             "paper_reports": paper_report_outputs,
         },
     )

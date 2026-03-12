@@ -252,8 +252,11 @@ class EnrichmentPipeline:
             return stats
 
         selected_classifications = classifications or self.settings.enrichment.process_classifications
+        effective_limit = limit or self.settings.enrichment.max_papers_per_run
+        if paper_ids:
+            effective_limit = max(effective_limit, len(set(paper_ids)))
         candidates = self.db.fetch_enrichment_candidates(
-            limit=limit or self.settings.enrichment.max_papers_per_run,
+            limit=effective_limit,
             classifications=selected_classifications,
             topic_ids=topic_ids,
             created_after=created_after,

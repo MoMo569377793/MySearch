@@ -170,27 +170,47 @@
     {
       "id": "ai_operator_acceleration",
       "display_name": "AI 算子加速",
-      "description": "跟踪算子优化、内核融合、编译器、推理与训练性能优化相关论文。",
+      "description": "跟踪 AI 算子优化、内核融合、编译器、GEMM/matmul、Tensor Core、ARM SVE/SME、推理与训练性能优化相关论文，并额外关注 CUTLASS、Triton、FlashAttention 系列扩展阅读线索。",
       "source_queries": {
         "arxiv": [
           "all:\"kernel fusion\"",
           "all:\"operator fusion\"",
           "all:\"tensor compiler\"",
           "all:\"FlashAttention\"",
-          "all:\"MLIR\" AND all:\"deep learning\""
+          "all:\"MLIR\" AND all:\"deep learning\"",
+          "all:\"CUTLASS\"",
+          "all:\"Triton\" AND all:\"compiler\"",
+          "all:\"GEMM optimization\"",
+          "all:\"matrix multiplication\" AND all:\"optimization\"",
+          "all:\"Tensor Core\" AND all:\"deep learning\"",
+          "all:\"SVE\" AND all:\"GEMM\"",
+          "all:\"SME\" AND all:\"GEMM\""
         ],
         "dblp": [
           "\"kernel fusion\" deep learning",
           "\"tensor compiler\" deep learning",
           "\"operator acceleration\" AI",
           "FlashAttention",
-          "MLIR deep learning compiler"
+          "MLIR deep learning compiler",
+          "CUTLASS GEMM",
+          "Triton compiler deep learning",
+          "\"GEMM optimization\" accelerator",
+          "\"matrix multiplication\" optimization",
+          "\"Tensor Core\" deep learning",
+          "ARM SVE GEMM",
+          "ARM SME GEMM"
         ],
         "google_scholar_alerts": [
           "\"kernel fusion\" transformer",
           "\"tensor compiler\" deep learning",
           "\"operator acceleration\" AI",
-          "FlashAttention kernel optimization"
+          "FlashAttention kernel optimization",
+          "CUTLASS GEMM kernel",
+          "Triton kernel compiler",
+          "\"GEMM optimization\" AI",
+          "\"Tensor Core\" transformer",
+          "\"ARM SVE\" GEMM",
+          "\"ARM SME\" GEMM"
         ]
       },
       "must_match_groups": [
@@ -199,7 +219,10 @@
           "operator",
           "compiler",
           "fusion",
-          "acceleration"
+          "acceleration",
+          "optimization",
+          "optimized",
+          "scheduling"
         ],
         [
           "deep learning",
@@ -207,7 +230,14 @@
           "transformer",
           "tensor",
           "inference",
-          "training"
+          "training",
+          "gemm",
+          "matmul",
+          "matrix multiplication",
+          "tensor core",
+          "arm",
+          "sve",
+          "sme"
         ]
       ],
       "positive_keywords": [
@@ -218,9 +248,23 @@
         "tensorrt",
         "cuda",
         "gemm",
+        "matmul",
+        "matrix multiplication",
         "attention kernel",
         "flashattention",
         "cutlass",
+        "wmma",
+        "mma",
+        "tensor core",
+        "tensor cores",
+        "cublas",
+        "rocblas",
+        "onednn",
+        "arm",
+        "armv9",
+        "sve",
+        "sme",
+        "neon",
         "graph compiler",
         "operator scheduling",
         "fusion pass",
@@ -240,6 +284,12 @@
         "cs.MS",
         "cs.PF"
       ],
+      "priority_arxiv_categories": [
+        "cs.DC",
+        "cs.AR",
+        "cs.PF",
+        "cs.LG"
+      ],
       "dblp_venue_keywords": [
         "ppopp",
         "mlsys",
@@ -247,7 +297,19 @@
         "micro",
         "hpca",
         "asplos",
-        "sc"
+        "sc",
+        "osdi",
+        "sosp"
+      ],
+      "priority_venue_keywords": [
+        "mlsys",
+        "ppopp",
+        "sc",
+        "isca",
+        "micro",
+        "asplos",
+        "osdi",
+        "sosp"
       ],
       "threshold": 18
     }

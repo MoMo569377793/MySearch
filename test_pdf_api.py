@@ -3,7 +3,7 @@
 
 import base64, requests, json, sys
 
-API_URL = "https://api.ikuncode.cc/v1/chat/completions"
+API_URL = ""
 API_KEY = ""
 MODEL   = "gpt-5.4"
 PDF_FILE = "artifacts/pdfs/2504.16214v3.pdf"

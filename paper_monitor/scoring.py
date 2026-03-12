@@ -15,6 +15,15 @@ def _combined_text(paper: PaperRecord) -> str:
     return normalize_title(" ".join(part for part in parts if part))
 
 
+def _category_hits(categories: list[str], categories_text: str) -> list[str]:
+    hits: list[str] = []
+    for category in categories:
+        needle = normalize_title(category)
+        if needle and needle in categories_text:
+            hits.append(category)
+    return hits
+
+
 def evaluate_paper_against_topic(paper: PaperRecord, topic: TopicConfig) -> TopicEvaluation:
     text = _combined_text(paper)
     venue_text = normalize_title(paper.venue)
@@ -45,13 +54,33 @@ def evaluate_paper_against_topic(paper: PaperRecord, topic: TopicConfig) -> Topi
         matched_keywords.extend(positive_hits)
         reasons.append(f"命中增强关键词: {', '.join(positive_hits[:5])}")
 
-    category_hits = [category for category in topic.arxiv_categories if category.lower() in categories_text]
+    priority_category_hits = _category_hits(topic.priority_arxiv_categories, categories_text)
+    if priority_category_hits:
+        score += 4.0 * len(priority_category_hits)
+        matched_keywords.extend(priority_category_hits)
+        reasons.append(f"命中优先 arXiv 分类: {', '.join(priority_category_hits[:4])}")
+
+    category_hits = [
+        category
+        for category in _category_hits(topic.arxiv_categories, categories_text)
+        if category not in priority_category_hits
+    ]
     if category_hits:
         score += 2.5 * len(category_hits)
         matched_keywords.extend(category_hits)
         reasons.append(f"命中 arXiv 分类: {', '.join(category_hits[:4])}")
 
-    venue_hits = [keyword for keyword in topic.dblp_venue_keywords if keyword_in_text(keyword, venue_text)]
+    priority_venue_hits = [keyword for keyword in topic.priority_venue_keywords if keyword_in_text(keyword, venue_text)]
+    if priority_venue_hits:
+        score += 3.5 * len(priority_venue_hits)
+        matched_keywords.extend(priority_venue_hits)
+        reasons.append(f"命中优先 venue 线索: {', '.join(priority_venue_hits[:4])}")
+
+    venue_hits = [
+        keyword
+        for keyword in topic.dblp_venue_keywords
+        if keyword not in priority_venue_hits and keyword_in_text(keyword, venue_text)
+    ]
     if venue_hits:
         score += 2.0 * len(venue_hits)
         matched_keywords.extend(venue_hits)
