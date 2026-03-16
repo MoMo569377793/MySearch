@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--days", type=int, help="统计窗口天数，默认使用配置中的 report.lookback_days")
     report_parser.add_argument("--with-llm", action="store_true", help="若已配置 LLM，则生成主题级聚合摘要")
     report_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+    report_parser.add_argument("--digest-primary-only", action="store_true", help="仅让主配置模型生成领域级聚合摘要；单篇多模型摘要仍会保留")
 
     paper_report_parser = subparsers.add_parser("paper-report", help="生成单篇论文的 Markdown / HTML / JSON 报告")
     paper_report_parser.add_argument("--paper-id", type=int, action="append", help="指定一个或多个 paper_id")
@@ -81,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_parser.add_argument("--classification", action="append", choices=["relevant", "maybe"])
     catalog_parser.add_argument("--with-llm", action="store_true", help="若已配置 LLM，则生成领域级聚合概览")
     catalog_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+    catalog_parser.add_argument("--digest-primary-only", action="store_true", help="仅让主配置模型生成领域级聚合概览；单篇多模型摘要仍会保留")
 
     paper_add_parser = subparsers.add_parser("paper-add", help="手动向数据库添加一篇论文并绑定到一个或多个领域")
     paper_add_parser.add_argument("--topic", action="append", required=True, help="目标 topic id，可重复传入")
@@ -125,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_parser.add_argument("--enrich-limit", type=int, help="本轮增强的论文数量上限")
     run_once_parser.add_argument("--with-llm", action="store_true", help="若已配置 LLM，则启用 LLM 摘要")
     run_once_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+    run_once_parser.add_argument("--digest-primary-only", action="store_true", help="仅让主配置模型生成领域级聚合摘要；单篇多模型摘要仍会保留")
     run_once_parser.add_argument("--skip-pdf", action="store_true", help="跳过 PDF 下载与全文抽取，只基于标题/摘要生成总结")
     run_once_parser.add_argument("--workers", type=int, default=1, help="增强阶段并发 worker 数，默认 1")
     run_once_parser.add_argument("--start-year", type=int, help="首次回填时只保留不早于该年份的论文")
@@ -141,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--enrich", action="store_true", help="每轮抓取后执行全文增强")
     daemon_parser.add_argument("--with-llm", action="store_true", help="若已配置 LLM，则启用 LLM 摘要")
     daemon_parser.add_argument("--extra-config", action="append", help="额外加载一份配置文件中的 LLM 变体")
+    daemon_parser.add_argument("--digest-primary-only", action="store_true", help="仅让主配置模型生成领域级聚合摘要；单篇多模型摘要仍会保留")
     daemon_parser.add_argument("--skip-pdf", action="store_true", help="跳过 PDF 下载与全文抽取，只基于标题/摘要生成总结")
     daemon_parser.add_argument("--workers", type=int, default=1, help="增强阶段并发 worker 数，默认 1")
     daemon_parser.add_argument("--since-last-run", action="store_true", help="每轮仅处理自上次成功抓取后新增的论文")
@@ -235,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     extra_configs = getattr(args, "extra_config", None) or []
     runtime_variants = build_runtime_variants(settings, extra_configs)
     enabled_variants = [variant for variant in runtime_variants if variant.client.enabled]
+    digest_variants = enabled_variants[:1] if getattr(args, "digest_primary_only", False) and enabled_variants else enabled_variants
     enrichment_pipeline = EnrichmentPipeline(settings, db, llm_variants=runtime_variants)
     llm_client = enabled_variants[0].client if enabled_variants else LLMClient(settings.llm)
     if getattr(args, "with_llm", False) and not enabled_variants:
@@ -382,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
                 lookback_days=args.days,
                 llm_client=llm_client,
                 llm_variants=enabled_variants,
+                topic_digest_variants=digest_variants,
                 use_llm_topic_digest=args.with_llm,
             )
             print(f"报告已生成: {paths['markdown']}")
@@ -397,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
                 topic_ids=args.topic,
                 classifications=args.classification,
                 llm_variants=enabled_variants,
+                topic_digest_variants=digest_variants,
                 use_llm_topic_digest=args.with_llm,
             )
             print(f"总览报告已生成: {paths['markdown']}")
@@ -470,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
                 lookback_days=args.days,
                 llm_client=llm_client,
                 llm_variants=enabled_variants,
+                topic_digest_variants=digest_variants,
                 use_llm_topic_digest=args.with_llm,
             )
             print(
@@ -508,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_document_processing=args.skip_pdf,
                 workers=args.workers,
                 since_last_run=args.since_last_run,
+                digest_primary_only=args.digest_primary_only,
                 secondary_priority_only=args.secondary_on_priority,
                 secondary_top_per_topic=args.secondary_top_per_topic,
                 secondary_min_score=args.secondary_min_score,

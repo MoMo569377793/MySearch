@@ -28,12 +28,14 @@ def run_daemon(
     skip_document_processing: bool = False,
     workers: int = 1,
     since_last_run: bool = False,
+    digest_primary_only: bool = False,
     secondary_priority_only: bool = False,
     secondary_top_per_topic: int = 3,
     secondary_min_score: float = 24.0,
 ) -> None:
     loops = 0
     runtime_variants = llm_variants or []
+    digest_variants = runtime_variants[:1] if digest_primary_only and runtime_variants else runtime_variants
     enrichment_pipeline = EnrichmentPipeline(settings, db, llm_variants=runtime_variants)
     if enrich and skip_document_processing and use_llm:
         LOGGER.warning("daemon 使用了 --skip-pdf + --with-llm，LLM 将无法读取完整 PDF 文本，只会基于标题/摘要生成总结。")
@@ -62,6 +64,7 @@ def run_daemon(
             report_date=report_date,
             report_type=report_type,
             llm_variants=runtime_variants,
+            topic_digest_variants=digest_variants,
             use_llm_topic_digest=bool(use_llm),
         )
         LOGGER.info(

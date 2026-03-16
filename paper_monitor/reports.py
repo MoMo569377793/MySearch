@@ -1374,10 +1374,12 @@ def generate_catalog_report(
     topic_ids: list[str] | None = None,
     classifications: list[str] | None = None,
     llm_variants: list[LLMRuntimeVariant] | None = None,
+    topic_digest_variants: list[LLMRuntimeVariant] | None = None,
     use_llm_topic_digest: bool = False,
 ) -> dict[str, str]:
     report_variants = list(llm_variants or [])
-    digest_steps = _active_variant_count(report_variants) * len(settings.topics) if use_llm_topic_digest else 0
+    digest_variants = list(topic_digest_variants or report_variants)
+    digest_steps = _active_variant_count(digest_variants) * len(settings.topics) if use_llm_topic_digest else 0
     progress_bar = ProgressBar("论文库总览", 6 + digest_steps)
     progress_bar.advance(detail="加载数据库论文")
     entries = db.fetch_catalog_entries(
@@ -1396,7 +1398,7 @@ def generate_catalog_report(
         settings,
         grouped_entries,
         visible_summaries_by_paper,
-        report_variants,
+        digest_variants,
         use_llm_topic_digest,
         progress_callback=lambda detail, advance: (
             progress_bar.advance(detail=detail) if advance else progress_bar.set_detail(detail)
@@ -1690,6 +1692,7 @@ def generate_report(
     lookback_days: int | None = None,
     llm_client: LLMClient | None = None,
     llm_variants: list[LLMRuntimeVariant] | None = None,
+    topic_digest_variants: list[LLMRuntimeVariant] | None = None,
     use_llm_topic_digest: bool = False,
 ) -> dict[str, str]:
     actual_lookback = lookback_days or settings.report.lookback_days
@@ -1697,7 +1700,8 @@ def generate_report(
     report_variants = list(llm_variants or [])
     if llm_client is not None and not report_variants:
         report_variants = [_single_runtime_variant(settings, llm_client)]
-    digest_steps = _active_variant_count(report_variants) * len(settings.topics) if use_llm_topic_digest else 0
+    digest_variants = list(topic_digest_variants or report_variants)
+    digest_steps = _active_variant_count(digest_variants) * len(settings.topics) if use_llm_topic_digest else 0
     progress_bar = ProgressBar(_report_label(report_type), 6 + digest_steps)
     progress_bar.advance(detail="加载命中论文")
     entries = db.fetch_report_entries(start_at, end_at, settings.report.include_maybe)
@@ -1712,7 +1716,7 @@ def generate_report(
         settings,
         grouped_entries,
         visible_summaries_by_paper,
-        report_variants,
+        digest_variants,
         use_llm_topic_digest,
         progress_callback=lambda detail, advance: (
             progress_bar.advance(detail=detail) if advance else progress_bar.set_detail(detail)

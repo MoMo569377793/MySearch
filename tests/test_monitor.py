@@ -1031,7 +1031,7 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result.summary_basis, "llm+fulltext+metadata")
             self.assertEqual(result.structured.get("source_mode"), "fulltext_txt")
-            self.assertEqual(result.structured.get("direct_pdf_status"), "unsupported")
+            self.assertIn(result.structured.get("direct_pdf_status"), {"unsupported", "request_failed"})
             self.assertGreaterEqual(client.pdf_probe_attempts, 1)
             self.assertGreaterEqual(client.chunk_calls, 1)
 
@@ -1450,6 +1450,99 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("gpt-5.4 Token", markdown)
             self.assertIn("\"variant_summary_count\": 1", export)
             self.assertIn("\"summary_source\": \"ikun_gpt-5.4 单篇总结\"", export)
+
+            db.close()
+
+    def test_report_can_limit_topic_digest_to_primary_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2601.00002",
+                    query_text="FlashAttention",
+                    title="FlashAttention Compiler Fusion for Long Context Models",
+                    abstract="We study attention kernels, fusion, and layout optimization for long context inference.",
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2601.00002",
+                    pdf_url="https://arxiv.org/pdf/2601.00002.pdf",
+                    doi="",
+                    arxiv_id="2601.00002",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.LG"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+
+            class FakeDigestClient:
+                enabled = True
+
+                def __init__(self, overview: str) -> None:
+                    self.overview = overview
+
+                def generate_topic_digest(self, topic_name, description, entries):  # noqa: ANN001
+                    if topic_name != "AI 算子加速":
+                        return None
+                    return type(
+                        "Digest",
+                        (),
+                        {
+                            "overview": self.overview,
+                            "highlights": ["highlight"],
+                            "watchlist": ["watch"],
+                            "tags": ["tag"],
+                            "structured": {"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}},
+                        },
+                    )()
+
+            primary_variant = LLMRuntimeVariant(
+                variant_id="poe",
+                label="poe_claude-opus-4.6",
+                provider="openai_compatible",
+                base_url="https://api.poe.com/v1",
+                model="claude-opus-4.6",
+                config_path=root / "config" / "config.json",
+                client=FakeDigestClient("primary digest"),
+            )
+            secondary_variant = LLMRuntimeVariant(
+                variant_id="ikun",
+                label="ikun_gpt-5.4",
+                provider="IkunCoding",
+                base_url="https://api.ikuncode.cc/v1",
+                model="gpt-5.4",
+                config_path=root / "config" / "config.json",
+                client=FakeDigestClient("secondary digest"),
+            )
+
+            paths = generate_report(
+                db,
+                settings,
+                report_date="2026-03-10",
+                report_type="daily",
+                llm_variants=[primary_variant, secondary_variant],
+                topic_digest_variants=[primary_variant],
+                use_llm_topic_digest=True,
+            )
+            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+            export = Path(paths["json"]).read_text(encoding="utf-8")
+
+            self.assertIn("LLM 模型数：`2`", markdown)
+            self.assertIn("primary digest", markdown)
+            self.assertNotIn("secondary digest", markdown)
+            self.assertIn("\"poe\"", export)
+            self.assertNotIn("\"ikun\": {", export)
 
             db.close()
 

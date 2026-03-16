@@ -12,13 +12,13 @@
    - GEMM / matmul / attention / kernel fusion / tensor compiler / CUTLASS / Triton / MLIR / Tensor Core / SVE / SME
 
 输出要求：
-- summary：180-300 字，必须体现“问题、方法、优化对象/平台、应用、结果”
+- summary：260-420 字，必须体现“问题、方法、优化对象/平台、应用、结果、为什么值得关注”
 - problem：写清优化瓶颈和目标对象
 - method：写清核心优化方法、实现系统、硬件或指令集线索
 - application：写清适用任务、硬件平台、部署场景或软件生态
 - results：优先写定量结果和比较对象；没有数字时要明确说明
-- contributions：2-4 条
-- limitations：2-4 条
+- contributions：3-5 条
+- limitations：3-5 条
 - tags：4-10 个中文或英文关键词，优先包含算子名、框架名、硬件名、方法名
 - basis：如果分块来自完整 PDF，请输出 llm+fulltext+metadata
 

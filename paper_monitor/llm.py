@@ -1350,7 +1350,8 @@ class LLMClient:
             return self.prompt_library.paper_summary_user(context)
         return (
             "请仅依据提供的信息进行总结，不要虚构实验结果。\n"
-            "summary 需要 120-220 字中文；contributions 和 limitations 各给 2-4 条短句数组；tags 给 3-8 个关键词。\n\n"
+            "summary 需要 220-380 字中文；problem/method/application/results 尽量各写 2-4 句；"
+            "contributions 和 limitations 各给 3-5 条短句数组；tags 给 5-12 个关键词。\n\n"
             f"标题: {context['title']}\n"
             f"作者: {context['authors']}\n"
             f"发表信息: venue={context['venue']}, published_at={context['published_at']}\n"
@@ -1396,8 +1397,13 @@ class LLMClient:
     def _build_pdf_brief_prompt(self, paper: PaperRecord, evaluations: list[TopicEvaluation]) -> str:
         _ = paper, evaluations
         return (
-            "请阅读全文后，用中文写一个紧凑摘要，必须包含：问题、方法、应用、结果、局限。"
-            "不要输出JSON，不要输出思考过程。总字数控制在300字以内。"
+            "请阅读全文后，用中文输出一份高质量的论文全文备忘录。"
+            "不要输出 JSON，不要输出思考过程，不要输出 Markdown 代码块。"
+            "请严格使用下面这些固定标签，并尽量写清数字、平台、基线、框架与局限：\n"
+            "摘要：\n问题：\n方法：\n应用：\n结果：\n贡献：\n局限：\n标签：\n"
+            "其中“结果”必须优先写定量性能或可扩展性结论；"
+            "“贡献”和“局限”尽量各写 3-5 条短句；"
+            "全文总长度控制在 450-700 字。"
         )
 
     def _build_pdf_brief_repair_prompt(
@@ -1498,8 +1504,10 @@ class LLMClient:
             f"主题: {topic_name}\n"
             f"说明: {description}\n"
             f"论文数量: {len(entries)}\n\n"
-            "请总结这个主题在当前时间窗口的趋势。highlights 应是 2-4 条关键观察，"
-            "watchlist 应是 2-4 条建议关注的论文或技术线索。\n\n"
+            "请总结这个主题在当前时间窗口的趋势。"
+            "overview 应写清主趋势、代表性方法、关键平台和后续跟踪价值；"
+            "highlights 应是 3-5 条具体观察；"
+            "watchlist 应是 3-5 条值得继续关注的论文或技术线索。\n\n"
             f"{joined}"
         )
 
