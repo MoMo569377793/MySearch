@@ -7,10 +7,10 @@ from pathlib import Path
 
 from paper_monitor.config import load_settings
 from paper_monitor.enrichment import DocumentArtifacts, EnrichmentPipeline
-from paper_monitor.llm import LLMClient
+from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import FetchPlan, LLMResult
-from paper_monitor.models import PaperCandidate, PaperRecord, RunStats, TopicEvaluation
+from paper_monitor.models import PaperCandidate, PaperRecord, ReportEntry, RunStats, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.reports import generate_catalog_report, generate_comparison_report, generate_paper_reports, generate_report
 from paper_monitor.scoring import evaluate_paper_against_topic
@@ -897,6 +897,164 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(result.structured.get("direct_pdf_status"), "unsupported")
             self.assertGreaterEqual(client.pdf_probe_attempts, 1)
             self.assertGreaterEqual(client.chunk_calls, 1)
+
+    def test_ikun_chat_payload_includes_reasoning_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.provider = "openai_compatible"
+            settings.llm.base_url = "https://example.invalid/v1"
+            settings.llm.model = "gpt-5.4"
+            settings.llm.api_key_env = ""
+            settings.llm.model_reasoning_effort = "xhigh"
+
+            class CaptureClient(LLMClient):
+                def __init__(self, config):  # noqa: ANN001
+                    super().__init__(config)
+                    self.payloads: list[dict] = []
+
+                def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                    self.payloads.append(payload)
+                    return {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }
+
+            client = CaptureClient(settings.llm)
+            text, _ = client._post_chat_completions_text("sys", "user", task_name="paper_summary")
+
+            self.assertEqual(text, "ok")
+            self.assertEqual(client.payloads[0].get("reasoning_effort"), "high")
+
+    def test_poe_gemini_payload_maps_reasoning_to_thinking_level(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.api_key_env = ""
+            settings.llm.model = "gemini-3.1-pro"
+            settings.llm.extra_body = {"reasoning_effort": "xhigh"}
+
+            class CaptureClient(LLMClient):
+                def __init__(self, config):  # noqa: ANN001
+                    super().__init__(config)
+                    self.payloads: list[dict] = []
+
+                def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                    self.payloads.append(payload)
+                    return {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }
+
+            client = CaptureClient(settings.llm)
+            text, _ = client._post_chat_completions_text("sys", "user", task_name="paper_summary")
+
+            self.assertEqual(text, "ok")
+            self.assertEqual(client.payloads[0].get("extra_body", {}).get("reasoning_effort"), "xhigh")
+            self.assertEqual(client.payloads[0].get("extra_body", {}).get("thinking_level"), "high")
+            self.assertNotIn("reasoning_effort", client.payloads[0])
+
+    def test_topic_digest_can_override_reasoning_by_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.provider = "openai_compatible"
+            settings.llm.base_url = "https://example.invalid/v1"
+            settings.llm.model = "gpt-5.4"
+            settings.llm.api_key_env = ""
+            settings.llm.enable_topic_digest = True
+            settings.llm.model_reasoning_effort = "low"
+            settings.llm.reasoning_by_task = {TASK_TOPIC_DIGEST: "xhigh"}
+
+            paper = PaperRecord(
+                id=1,
+                title="Test Paper",
+                title_norm="test paper",
+                abstract="abstract",
+                authors=["Alice"],
+                published_at="2026-03-10T09:00:00+08:00",
+                updated_at="2026-03-10T09:00:00+08:00",
+                primary_url="https://example.invalid/paper",
+                pdf_url="",
+                doi="",
+                arxiv_id="",
+                venue="MLSys",
+                year=2026,
+                categories=["cs.LG"],
+                summary_text="默认总结",
+                summary_basis="llm+metadata",
+                tags=["gemm"],
+                pdf_local_path="",
+                pdf_status="",
+                pdf_downloaded_at=None,
+                fulltext_txt_path="",
+                fulltext_excerpt="",
+                fulltext_status="",
+                page_count=None,
+                llm_summary={},
+                analysis_updated_at=None,
+                source_first="arxiv",
+                created_at="2026-03-10T09:00:00+08:00",
+                last_seen_at="2026-03-10T09:00:00+08:00",
+                metadata={},
+            )
+            entry = ReportEntry(
+                topic_id="ai_operator_acceleration",
+                topic_name="AI 算子加速",
+                score=30.0,
+                classification="relevant",
+                matched_keywords=["gemm", "tensor core"],
+                reasons=["fixture"],
+                paper=paper,
+                source_names=["arxiv"],
+                source_urls=["https://example.invalid/paper"],
+            )
+
+            class CaptureClient(LLMClient):
+                def __init__(self, config):  # noqa: ANN001
+                    super().__init__(config)
+                    self.payloads: list[dict] = []
+
+                def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                    self.payloads.append(payload)
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "topic_digest": {
+                                                "overview": "概览",
+                                                "highlights": ["亮点"],
+                                                "watchlist": ["观察点"],
+                                                "tags": ["gemm"],
+                                            }
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }
+
+            client = CaptureClient(settings.llm)
+            digest = client.generate_topic_digest("AI 算子加速", "desc", [entry])
+
+            self.assertIsNotNone(digest)
+            self.assertEqual(client.payloads[0].get("reasoning_effort"), "xhigh")
 
     def test_enrichment_candidates_prioritize_missing_llm_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

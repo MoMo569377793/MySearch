@@ -89,9 +89,14 @@ DEFAULT_CONFIG = {
         "model": "",
         "timeout_seconds": 60,
         "temperature": 0.2,
+        "model_reasoning_effort": "",
+        "model_thinking_level": "",
         "max_input_chars": 16000,
         "max_output_tokens": 700,
         "store": False,
+        "extra_body": {},
+        "reasoning_by_task": {},
+        "thinking_level_by_task": {},
         "enable_topic_digest": False,
         "topic_digest_entry_limit": 8,
         "fulltext_chunk_chars": 10000,
@@ -334,9 +339,18 @@ def _build_llm_config(raw: dict, *, config_stem: str, index: int, primary: bool)
         model=model,
         timeout_seconds=int(raw.get("timeout_seconds", 60)),
         temperature=float(raw.get("temperature", 0.2)),
+        model_reasoning_effort=str(raw.get("model_reasoning_effort", raw.get("reasoning_effort", ""))),
+        model_thinking_level=str(raw.get("model_thinking_level", raw.get("thinking_level", ""))),
         max_input_chars=int(raw.get("max_input_chars", 16000)),
         max_output_tokens=int(raw.get("max_output_tokens", 700)),
         store=bool(raw.get("store", False)),
+        extra_body=dict(raw.get("extra_body", {})) if isinstance(raw.get("extra_body", {}), dict) else {},
+        reasoning_by_task=(
+            dict(raw.get("reasoning_by_task", {})) if isinstance(raw.get("reasoning_by_task", {}), dict) else {}
+        ),
+        thinking_level_by_task=(
+            dict(raw.get("thinking_level_by_task", {})) if isinstance(raw.get("thinking_level_by_task", {}), dict) else {}
+        ),
         enable_topic_digest=bool(raw.get("enable_topic_digest", False)),
         topic_digest_entry_limit=int(raw.get("topic_digest_entry_limit", 8)),
         fulltext_chunk_chars=int(raw.get("fulltext_chunk_chars", 10000)),

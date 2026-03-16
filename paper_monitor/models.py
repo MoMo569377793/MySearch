@@ -73,9 +73,14 @@ class LLMConfig:
     model: str = ""
     timeout_seconds: int = 60
     temperature: float = 0.2
+    model_reasoning_effort: str = ""
+    model_thinking_level: str = ""
     max_input_chars: int = 16000
     max_output_tokens: int = 700
     store: bool = False
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    reasoning_by_task: dict[str, str] = field(default_factory=dict)
+    thinking_level_by_task: dict[str, str] = field(default_factory=dict)
     enable_topic_digest: bool = False
     topic_digest_entry_limit: int = 8
     fulltext_chunk_chars: int = 10000

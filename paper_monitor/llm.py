@@ -32,6 +32,11 @@ THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 PDF_STRATEGY_RESPONSES = "responses_input_file"
 PDF_STRATEGY_CHAT_FILE = "chat_file"
 PDF_STRATEGY_CHAT_INPUT_FILE = "chat_input_file"
+TASK_PAPER_SUMMARY = "paper_summary"
+TASK_PAPER_CHUNK = "paper_chunk"
+TASK_PAPER_REDUCE = "paper_reduce"
+TASK_TOPIC_DIGEST = "topic_digest"
+TASK_JSON_REPAIR = "json_repair"
 
 
 class LLMClient:
@@ -111,6 +116,7 @@ class LLMClient:
                     schema_name="paper_summary",
                     schema=self._paper_summary_schema(),
                     max_output_tokens=max(self.config.max_output_tokens, 1200),
+                    task_name=TASK_PAPER_SUMMARY,
                 )
                 if parsed:
                     LOGGER.info(
@@ -124,6 +130,7 @@ class LLMClient:
                     user_prompt=self._build_paper_prompt(paper, evaluations),
                     schema_name="paper_summary",
                     schema=self._paper_summary_schema(),
+                    task_name=TASK_PAPER_SUMMARY,
                 )
                 if parsed:
                     LOGGER.info(
@@ -141,6 +148,7 @@ class LLMClient:
                     schema_name="paper_summary",
                     schema=self._paper_summary_schema(),
                     max_output_tokens=max(self.config.max_output_tokens, 1200),
+                    task_name=TASK_PAPER_SUMMARY,
                 )
                 if parsed:
                     LOGGER.info(
@@ -200,6 +208,7 @@ class LLMClient:
                 schema_name="topic_digest",
                 schema=self._topic_digest_schema(),
                 max_output_tokens=max(self.config.max_output_tokens, 1400),
+                task_name=TASK_TOPIC_DIGEST,
             )
         if not parsed:
             user_prompt = self._build_topic_digest_prompt(topic_name, description, limited_entries)
@@ -208,6 +217,7 @@ class LLMClient:
                 user_prompt=user_prompt,
                 schema_name="topic_digest",
                 schema=self._topic_digest_schema(),
+                task_name=TASK_TOPIC_DIGEST,
             )
         if not parsed:
             parsed, usage = self._request_structured_json(
@@ -219,6 +229,7 @@ class LLMClient:
                 schema_name="topic_digest",
                 schema=self._topic_digest_schema(),
                 max_output_tokens=max(self.config.max_output_tokens, 1800),
+                task_name=TASK_TOPIC_DIGEST,
             )
         if not parsed and not prefer_compact:
             parsed, usage = self._request_structured_json(
@@ -231,6 +242,7 @@ class LLMClient:
                 schema_name="topic_digest",
                 schema=self._topic_digest_schema(),
                 max_output_tokens=max(self.config.max_output_tokens, 1400),
+                task_name=TASK_TOPIC_DIGEST,
             )
         if not parsed:
             return None
@@ -243,6 +255,69 @@ class LLMClient:
             structured=parsed,
         )
 
+    def _reasoning_effort_for_task(self, task_name: str) -> str:
+        task_value = str(self.config.reasoning_by_task.get(task_name, "")).strip()
+        if task_value:
+            return task_value
+        global_value = str(self.config.model_reasoning_effort).strip()
+        if global_value:
+            return global_value
+        return str(self.config.extra_body.get("reasoning_effort", "")).strip()
+
+    def _thinking_level_for_task(self, task_name: str) -> str:
+        task_value = str(self.config.thinking_level_by_task.get(task_name, "")).strip()
+        if task_value:
+            return task_value
+        global_value = str(self.config.model_thinking_level).strip()
+        if global_value:
+            return global_value
+        configured_value = str(self.config.extra_body.get("thinking_level", "")).strip()
+        if configured_value:
+            return configured_value
+        if self._is_poe_api() and self._is_gemini_model():
+            reasoning_effort = self._reasoning_effort_for_task(task_name)
+            if reasoning_effort:
+                return self._map_reasoning_effort_to_poe_thinking_level(reasoning_effort)
+        return ""
+
+    def _is_poe_api(self) -> bool:
+        return "api.poe.com" in self.config.base_url.lower()
+
+    def _is_gemini_model(self) -> bool:
+        return self.config.model.strip().lower().startswith("gemini")
+
+    def _map_reasoning_effort_to_poe_thinking_level(self, reasoning_effort: str) -> str:
+        value = reasoning_effort.strip().lower()
+        if not value:
+            return ""
+        if value in {"high", "xhigh", "max"}:
+            return "high"
+        return "low"
+
+    def _apply_chat_request_options(self, payload: dict[str, Any], *, task_name: str) -> dict[str, Any]:
+        extra_body = dict(self.config.extra_body or {})
+        reasoning_effort = self._reasoning_effort_for_task(task_name)
+        thinking_level = self._thinking_level_for_task(task_name)
+
+        if self._is_poe_api():
+            if self._is_gemini_model():
+                if thinking_level:
+                    extra_body["thinking_level"] = thinking_level
+            elif reasoning_effort and "reasoning_effort" not in extra_body:
+                extra_body["reasoning_effort"] = reasoning_effort
+        elif reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+
+        if extra_body:
+            payload["extra_body"] = extra_body
+        return payload
+
+    def _apply_responses_request_options(self, payload: dict[str, Any], *, task_name: str) -> dict[str, Any]:
+        reasoning_effort = self._reasoning_effort_for_task(task_name)
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
+        return payload
+
     def _request_structured_json(
         self,
         *,
@@ -251,6 +326,7 @@ class LLMClient:
         schema_name: str,
         schema: dict[str, Any],
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         if self.provider in {"openai_responses", "openai", "responses"}:
             content, usage = self._post_responses(
@@ -259,6 +335,7 @@ class LLMClient:
                 schema_name,
                 schema,
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         else:
             content, usage = self._post_chat_completions(
@@ -267,12 +344,13 @@ class LLMClient:
                 schema_name,
                 schema,
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         if not content:
             return None, usage
         parsed = self._parse_response_json(content)
         if parsed is None:
-            repaired, repair_usage = self._repair_response_json(content, schema_name, schema)
+            repaired, repair_usage = self._repair_response_json(content, schema_name, schema, task_name=TASK_JSON_REPAIR)
             if repaired is not None:
                 return repaired, self._merge_usage_items([usage, repair_usage])
             return None, self._merge_usage_items([usage])
@@ -286,18 +364,21 @@ class LLMClient:
         system_prompt: str,
         user_prompt: str,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_CHUNK,
     ) -> tuple[str | None, dict[str, Any]]:
         if self.provider in {"openai_responses", "openai", "responses"}:
             content, usage = self._post_responses_text(
                 system_prompt,
                 user_prompt,
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         else:
             content, usage = self._post_chat_completions_text(
                 system_prompt,
                 user_prompt,
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         if not content:
             return None, usage
@@ -313,6 +394,7 @@ class LLMClient:
         pdf_path: Path,
         pdf_strategy: str,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         data_url = self._build_pdf_data_url(pdf_path)
         if not data_url:
@@ -326,6 +408,7 @@ class LLMClient:
                 pdf_filename=pdf_path.name,
                 pdf_data_url=data_url,
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         elif pdf_strategy in {PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE}:
             content, usage = self._post_chat_completions_with_pdf(
@@ -337,6 +420,7 @@ class LLMClient:
                 pdf_data_url=data_url,
                 file_item_type="file" if pdf_strategy == PDF_STRATEGY_CHAT_FILE else "input_file",
                 max_output_tokens=max_output_tokens,
+                task_name=task_name,
             )
         else:
             return None, {}
@@ -344,7 +428,7 @@ class LLMClient:
             return None, usage
         parsed = self._parse_response_json(content)
         if parsed is None:
-            repaired, repair_usage = self._repair_response_json(content, schema_name, schema)
+            repaired, repair_usage = self._repair_response_json(content, schema_name, schema, task_name=TASK_JSON_REPAIR)
             if repaired is not None:
                 return repaired, self._merge_usage_items([usage, repair_usage])
             return None, self._merge_usage_items([usage])
@@ -357,6 +441,8 @@ class LLMClient:
         content: str,
         schema_name: str,
         schema: dict[str, Any],
+        *,
+        task_name: str = TASK_JSON_REPAIR,
     ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         repair_system = (
             "你是一个 JSON 修复助手。"
@@ -375,6 +461,7 @@ class LLMClient:
                 schema_name,
                 schema,
                 max_output_tokens=max(self.config.max_output_tokens, 1000),
+                task_name=task_name,
             )
         else:
             repaired_text, usage = self._post_chat_completions(
@@ -383,6 +470,7 @@ class LLMClient:
                 schema_name,
                 schema,
                 max_output_tokens=max(self.config.max_output_tokens, 1000),
+                task_name=task_name,
             )
         if not repaired_text:
             return None, usage
@@ -399,6 +487,7 @@ class LLMClient:
         schema: dict[str, Any],
         *,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[str | None, dict[str, Any]]:
         prompt_with_schema = (
             f"{user_prompt}\n\n"
@@ -414,6 +503,7 @@ class LLMClient:
                 {"role": "user", "content": prompt_with_schema},
             ],
         }
+        payload = self._apply_chat_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/chat/completions", payload)
         if not data:
             return None, {}
@@ -437,6 +527,7 @@ class LLMClient:
         pdf_data_url: str,
         file_item_type: str,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[str | None, dict[str, Any]]:
         prompt_with_schema = (
             f"{user_prompt}\n\n"
@@ -473,6 +564,7 @@ class LLMClient:
                 },
             ],
         }
+        payload = self._apply_chat_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/chat/completions", payload, warn_on_error=False)
         if not data:
             return None, {}
@@ -491,6 +583,7 @@ class LLMClient:
         user_prompt: str,
         *,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_CHUNK,
     ) -> tuple[str | None, dict[str, Any]]:
         payload = {
             "model": self.config.model,
@@ -501,6 +594,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
         }
+        payload = self._apply_chat_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/chat/completions", payload)
         if not data:
             return None, {}
@@ -521,6 +615,7 @@ class LLMClient:
         schema: dict[str, Any],
         *,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[str | None, dict[str, Any]]:
         payload = {
             "model": self.config.model,
@@ -538,6 +633,7 @@ class LLMClient:
                 }
             },
         }
+        payload = self._apply_responses_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/responses", payload)
         if not data:
             return None, {}
@@ -553,6 +649,7 @@ class LLMClient:
         pdf_filename: str,
         pdf_data_url: str,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_SUMMARY,
     ) -> tuple[str | None, dict[str, Any]]:
         payload = {
             "model": self.config.model,
@@ -582,6 +679,7 @@ class LLMClient:
                 }
             },
         }
+        payload = self._apply_responses_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/responses", payload, warn_on_error=False)
         if not data:
             return None, {}
@@ -593,6 +691,7 @@ class LLMClient:
         user_prompt: str,
         *,
         max_output_tokens: int | None = None,
+        task_name: str = TASK_PAPER_CHUNK,
     ) -> tuple[str | None, dict[str, Any]]:
         payload = {
             "model": self.config.model,
@@ -602,6 +701,7 @@ class LLMClient:
             "max_output_tokens": max_output_tokens or self.config.max_output_tokens,
             "store": self.config.store,
         }
+        payload = self._apply_responses_request_options(payload, task_name=task_name)
         data = self._post_json(self.config.base_url.rstrip("/") + "/responses", payload)
         if not data:
             return None, {}
@@ -766,6 +866,7 @@ class LLMClient:
                     chunk_total=len(chunks),
                 ),
                 max_output_tokens=max(600, min(self.config.max_output_tokens, 900)),
+                task_name=TASK_PAPER_CHUNK,
             )
             usage_items.append(usage)
             if note_text:
@@ -780,6 +881,7 @@ class LLMClient:
             schema_name="paper_summary",
             schema=self._paper_summary_schema(),
             max_output_tokens=max(self.config.max_output_tokens, 1200),
+            task_name=TASK_PAPER_REDUCE,
         )
         usage_items.append(usage)
         if not parsed:
@@ -811,6 +913,7 @@ class LLMClient:
                 pdf_path=pdf_path,
                 pdf_strategy=pdf_strategy,
                 max_output_tokens=max(self.config.max_output_tokens, 1200),
+                task_name=TASK_PAPER_SUMMARY,
             )
             usage_items.append(usage)
         if not parsed:
@@ -825,6 +928,7 @@ class LLMClient:
                 pdf_path=pdf_path,
                 pdf_strategy=pdf_strategy,
                 max_output_tokens=max(self.config.max_output_tokens, 1400),
+                task_name=TASK_PAPER_SUMMARY,
             )
             usage_items.append(usage)
         if not parsed and not prefer_compact:
@@ -839,6 +943,7 @@ class LLMClient:
                 pdf_path=pdf_path,
                 pdf_strategy=pdf_strategy,
                 max_output_tokens=max(self.config.max_output_tokens, 1200),
+                task_name=TASK_PAPER_SUMMARY,
             )
             usage_items.append(usage)
         if not parsed:
