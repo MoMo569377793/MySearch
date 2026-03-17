@@ -620,6 +620,10 @@ class Database:
         ).fetchall()
         return {row["variant_id"] for row in rows}
 
+    def fetch_paper_llm_summary_map(self, paper_id: int) -> dict[str, PaperLLMSummary]:
+        grouped = self.fetch_paper_llm_summaries([paper_id])
+        return {summary.variant_id: summary for summary in grouped.get(paper_id, [])}
+
     def upsert_match(self, paper_id: int, evaluation: TopicEvaluation) -> bool:
         now = now_iso(self.timezone_name)
         existing = self.connection.execute(

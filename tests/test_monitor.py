@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 
 from paper_monitor.config import load_settings
-from paper_monitor.enrichment import DocumentArtifacts, EnrichmentPipeline
-from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST
+from paper_monitor.enrichment import DocumentArtifacts, DocumentProcessor, EnrichmentPipeline
+from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import FetchPlan, LLMResult
 from paper_monitor.models import PaperCandidate, PaperRecord, ReportEntry, RunStats, TopicEvaluation
@@ -525,6 +525,117 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM paper_llm_summaries").fetchone()[0], 2)
             db.close()
 
+    def test_enrichment_retries_fallback_variant_but_skips_completed_pdf_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.base_url = "http://example.invalid/v1"
+            settings.llm.model = "dummy-model"
+
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2502.00001",
+                    query_text="matrix-free finite element",
+                    title="Matrix-Free Retry Sample",
+                    abstract="matrix-free finite element operator application on GPUs",
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2502.00001",
+                    pdf_url="https://arxiv.org/pdf/2502.00001.pdf",
+                    doi="",
+                    arxiv_id="2502.00001",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.DC"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id="ikun",
+                variant_label="ikun_gpt-5.4",
+                provider="IkunCoding",
+                base_url="https://api.ikuncode.cc/v1",
+                model="gpt-5.4",
+                summary_text="旧的全文回退总结",
+                summary_basis="llm+fulltext+metadata",
+                tags=["matrix-free"],
+                structured={"summary": "旧的全文回退总结", "source_mode": "fulltext_txt", "direct_pdf_status": "request_failed"},
+                usage={},
+            )
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id="poe",
+                variant_label="poe_claude-opus-4.6",
+                provider="openai_compatible",
+                base_url="https://api.poe.com/v1",
+                model="claude-opus-4.6",
+                summary_text=(
+                    "已有 PDF 直读总结：论文围绕 matrix-free 有限元算子在 GPU 上的加速实现，"
+                    "详细说明了问题背景、partial assembly 方法和实验结果。"
+                ),
+                summary_basis="llm+pdf+metadata",
+                tags=["matrix-free"],
+                structured={
+                    "summary": "论文围绕 matrix-free 有限元算子在 GPU 上的加速实现，详细说明了问题背景、partial assembly 方法和实验结果。",
+                    "problem": "高阶有限元算子应用在 GPU 上面临带宽与访存瓶颈。",
+                    "method": "结合 partial assembly 与矩阵自由实现。",
+                    "application": "GPU 求解场景。",
+                    "results": "性能与扩展性均有提升。",
+                    "source_mode": "pdf_direct",
+                    "direct_pdf_status": "used",
+                },
+                usage={},
+            )
+
+            dummy_client = LLMClient(settings.llm)
+            variants = [
+                LLMRuntimeVariant(
+                    variant_id="ikun",
+                    label="ikun_gpt-5.4",
+                    provider="IkunCoding",
+                    base_url="https://api.ikuncode.cc/v1",
+                    model="gpt-5.4",
+                    config_path=root / "config" / "config-ikun.json",
+                    client=dummy_client,
+                ),
+                LLMRuntimeVariant(
+                    variant_id="poe",
+                    label="poe_claude-opus-4.6",
+                    provider="openai_compatible",
+                    base_url="https://api.poe.com/v1",
+                    model="claude-opus-4.6",
+                    config_path=root / "config" / "config-poe.json",
+                    client=dummy_client,
+                ),
+            ]
+
+            enrichment_pipeline = EnrichmentPipeline(settings, db, llm_variants=variants)
+            refresh_variants = enrichment_pipeline._select_variants_needing_refresh(1, variants, force=False)  # noqa: SLF001
+
+            self.assertEqual([variant.variant_id for variant in refresh_variants], ["ikun"])
+            self.assertFalse(
+                enrichment_pipeline._should_skip(  # noqa: SLF001
+                    db.get_paper(1),
+                    force=False,
+                    use_llm=True,
+                    target_variants=variants,
+                )
+            )
+            db.close()
+
     def test_enrichment_can_filter_by_created_after(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -865,6 +976,323 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertTrue(result.structured.get("pdf_input_used"))
             self.assertEqual(result.structured.get("pdf_input_strategy"), "chat_file")
             self.assertGreaterEqual(client.pdf_request_count, 2)
+
+    def test_llm_pdf_request_retries_alternate_file_format_on_unknown_parameter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.provider = "openai_compatible"
+            settings.llm.base_url = "https://example.invalid/v1"
+            settings.llm.model = "dummy-model"
+            settings.llm.api_key_env = ""
+            settings.llm.pdf_input_mode = "force"
+
+            pdf_path = root / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n% fake pdf for test\n")
+
+            paper = PaperRecord(
+                id=1,
+                title="Alternate PDF Format Paper",
+                title_norm="alternate pdf format paper",
+                abstract="An abstract.",
+                authors=["Alice"],
+                published_at="2026-03-10T09:00:00+08:00",
+                updated_at="2026-03-10T09:00:00+08:00",
+                primary_url="https://example.invalid/paper",
+                pdf_url="https://example.invalid/paper.pdf",
+                doi="",
+                arxiv_id="",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.NA"],
+                summary_text="",
+                summary_basis="metadata-only",
+                tags=[],
+                pdf_local_path=str(pdf_path),
+                pdf_status="downloaded",
+                pdf_downloaded_at="2026-03-10T10:00:00+08:00",
+                fulltext_txt_path="",
+                fulltext_excerpt="",
+                fulltext_status="empty",
+                page_count=8,
+                llm_summary={},
+                analysis_updated_at=None,
+                source_first="arxiv",
+                created_at="2026-03-10T09:00:00+08:00",
+                last_seen_at="2026-03-10T09:00:00+08:00",
+                metadata={},
+            )
+            evaluations = [
+                type(
+                    "Eval",
+                    (),
+                    {
+                        "classification": "relevant",
+                        "topic_name": "有限元分析 Matrix-Free 算法优化",
+                        "score": 30.0,
+                        "matched_keywords": ["matrix-free", "finite element"],
+                    },
+                )()
+            ]
+
+            class RetryPDFClient(LLMClient):
+                def __init__(self, config):  # noqa: ANN001
+                    super().__init__(config)
+                    self.enabled = True
+                    self.attempts: list[str] = []
+
+                def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                    messages = payload.get("messages", [])
+                    user_content = messages[0].get("content", []) if messages else []
+                    if not isinstance(user_content, list):
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": (
+                                            "{\"summary\":\"模型改用 input_file 后成功读取 PDF，并生成了结构化论文总结。\","
+                                            "\"problem\":\"论文关注 matrix-free 有限元算子在 GPU 上的性能瓶颈。\","
+                                            "\"method\":\"方法结合 partial assembly 与矩阵自由算子实现。\","
+                                            "\"application\":\"适用于高阶有限元和 GPU 求解场景。\","
+                                            "\"results\":\"实验结果显示吞吐与扩展性均得到提升。\","
+                                            "\"contributions\":[\"给出结构化 PDF 直读总结\"],"
+                                            "\"limitations\":[\"需要后端支持文件输入\"],\"tags\":[\"matrix-free\"],"
+                                            "\"basis\":\"llm+pdf+metadata\"}"
+                                        )
+                                    }
+                                }
+                            ],
+                            "usage": {"input_tokens": 30, "output_tokens": 20, "total_tokens": 50},
+                        }
+                    first_item = user_content[0]
+                    if isinstance(first_item, dict) and first_item.get("type") == "file":
+                        self.attempts.append("chat_file")
+                        self._last_request_failure = (
+                            "http_400:{\"error\":{\"message\":\"Unknown parameter: 'input[0].content[0].file'.\"}}"
+                        )
+                        return None
+                    if isinstance(first_item, dict) and first_item.get("type") == "input_file":
+                        self.attempts.append("chat_input_file")
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": (
+                                            "{\"summary\":\"模型改用 input_file 后成功读取 PDF。\","
+                                            "\"problem\":\"问题。\",\"method\":\"方法。\",\"application\":\"应用。\","
+                                            "\"results\":\"结果。\",\"contributions\":[\"贡献\"],"
+                                            "\"limitations\":[\"局限\"],\"tags\":[\"matrix-free\"],"
+                                            "\"basis\":\"llm+pdf+metadata\"}"
+                                        )
+                                    }
+                                }
+                            ],
+                            "usage": {"input_tokens": 50, "output_tokens": 20, "total_tokens": 70},
+                        }
+                    raise AssertionError("unexpected payload")
+
+                def _request_text(self, **kwargs):  # noqa: ANN003
+                    raise AssertionError("fulltext fallback should not run after alternate pdf format succeeds")
+
+            client = RetryPDFClient(settings.llm)
+            result = client.generate_summary(paper, evaluations)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(client.attempts[:2], ["chat_file", "chat_input_file"])
+            self.assertIn("chat_input_file", client.attempts)
+            self.assertEqual(result.summary_basis, "llm+pdf+metadata")
+            self.assertEqual(result.structured.get("source_mode"), "pdf_direct")
+            self.assertEqual(result.structured.get("pdf_input_strategy"), "chat_input_file")
+
+    def test_invalid_direct_pdf_response_is_not_treated_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.provider = "openai_compatible"
+            settings.llm.base_url = "https://example.invalid/v1"
+            settings.llm.model = "dummy-model"
+            settings.llm.api_key_env = ""
+            settings.llm.pdf_input_mode = "force"
+
+            pdf_path = root / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n% fake pdf for test\n")
+            fulltext_path = root / "paper.txt"
+            fulltext_path.write_text("fallback fulltext content", encoding="utf-8")
+
+            paper = PaperRecord(
+                id=1,
+                title="Invalid Direct PDF Response Paper",
+                title_norm="invalid direct pdf response paper",
+                abstract="An abstract.",
+                authors=["Alice"],
+                published_at="2026-03-10T09:00:00+08:00",
+                updated_at="2026-03-10T09:00:00+08:00",
+                primary_url="https://example.invalid/paper",
+                pdf_url="https://example.invalid/paper.pdf",
+                doi="",
+                arxiv_id="",
+                venue="arXiv",
+                year=2026,
+                categories=["cs.NA"],
+                summary_text="",
+                summary_basis="metadata-only",
+                tags=[],
+                pdf_local_path=str(pdf_path),
+                pdf_status="downloaded",
+                pdf_downloaded_at="2026-03-10T10:00:00+08:00",
+                fulltext_txt_path=str(fulltext_path),
+                fulltext_excerpt="fallback excerpt",
+                fulltext_status="extracted",
+                page_count=8,
+                llm_summary={},
+                analysis_updated_at=None,
+                source_first="arxiv",
+                created_at="2026-03-10T09:00:00+08:00",
+                last_seen_at="2026-03-10T09:00:00+08:00",
+                metadata={},
+            )
+            evaluations = [
+                type(
+                    "Eval",
+                    (),
+                    {
+                        "classification": "relevant",
+                        "topic_name": "有限元分析 Matrix-Free 算法优化",
+                        "score": 30.0,
+                        "matched_keywords": ["matrix-free", "finite element"],
+                    },
+                )()
+            ]
+
+            class InvalidPDFClient(LLMClient):
+                def __init__(self, config):  # noqa: ANN001
+                    super().__init__(config)
+                    self.enabled = True
+                    self.fulltext_called = False
+
+                def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                    messages = payload.get("messages", [])
+                    user_content = messages[0].get("content", []) if messages else []
+                    if isinstance(user_content, list):
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": (
+                                            "摘要：当前对话中未提供论文全文，因此我无法阅读全文后给出可靠总结。\n"
+                                            "问题：缺少论文原文。\n"
+                                            "方法：请发送 PDF。\n"
+                                            "应用：无。\n"
+                                            "结果：无。\n"
+                                            "贡献：无。\n"
+                                            "局限：缺少原文。\n"
+                                            "标签：无"
+                                        )
+                                    }
+                                }
+                            ],
+                            "usage": {"input_tokens": 80, "output_tokens": 40, "total_tokens": 120},
+                        }
+                    raise AssertionError("unexpected non-pdf request")
+
+                def _request_text(self, **kwargs):  # noqa: ANN003
+                    self.fulltext_called = True
+                    return (
+                        "分块概括：基于全文文本回退成功。\n"
+                        "关键方法：fulltext fallback。\n"
+                        "结果/证据：可继续生成结构化总结。\n"
+                        "应用场景：测试。\n"
+                        "局限：无。",
+                        {"input_tokens": 12, "output_tokens": 6, "total_tokens": 18},
+                    )
+
+                def _request_structured_json(self, **kwargs):  # noqa: ANN003
+                    return (
+                        {
+                            "summary": "通过全文文本回退生成总结。",
+                            "problem": "问题。",
+                            "method": "方法。",
+                            "application": "应用。",
+                            "results": "结果。",
+                            "contributions": ["贡献"],
+                            "limitations": ["局限"],
+                            "tags": ["fallback"],
+                            "basis": "llm+fulltext+metadata",
+                        },
+                        {"input_tokens": 20, "output_tokens": 8, "total_tokens": 28},
+                    )
+
+            client = InvalidPDFClient(settings.llm)
+            result = client.generate_summary(paper, evaluations)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(client.fulltext_called)
+            self.assertEqual(result.structured.get("source_mode"), "fulltext_txt")
+            self.assertEqual(result.structured.get("direct_pdf_status"), "invalid_response")
+            self.assertTrue(
+                looks_like_invalid_direct_pdf_summary(
+                    {"summary": "当前对话中未提供论文全文，因此无法总结。"},
+                    "当前对话中未提供论文全文，因此无法总结。",
+                )
+            )
+
+    def test_document_processor_can_infer_arxiv_pdf_from_dblp_metadata(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        processor = DocumentProcessor(settings.enrichment, "test-agent", settings.timezone)
+        paper = PaperRecord(
+            id=1,
+            title="CoRR Paper",
+            title_norm="corr paper",
+            abstract="",
+            authors=["Alice"],
+            published_at="2026-03-10",
+            updated_at="2026-03-10",
+            primary_url="https://doi.org/10.48550/arXiv.2308.01792",
+            pdf_url="",
+            doi="10.48550/ARXIV.2308.01792",
+            arxiv_id="",
+            venue="CoRR",
+            year=2023,
+            categories=["cs.NA"],
+            summary_text="",
+            summary_basis="metadata-only",
+            tags=[],
+            pdf_local_path="",
+            pdf_status="pending",
+            pdf_downloaded_at=None,
+            fulltext_txt_path="",
+            fulltext_excerpt="",
+            fulltext_status="empty",
+            page_count=None,
+            llm_summary={},
+            analysis_updated_at=None,
+            source_first="dblp",
+            created_at="2026-03-10T09:00:00+08:00",
+            last_seen_at="2026-03-10T09:00:00+08:00",
+            metadata={
+                "dblp": {
+                    "hit": {
+                        "info": {
+                            "access": "open",
+                            "doi": "10.48550/ARXIV.2308.01792",
+                            "ee": "https://doi.org/10.48550/arXiv.2308.01792",
+                        }
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(processor.resolve_pdf_url(paper), "https://arxiv.org/pdf/2308.01792.pdf")
 
     def test_parse_pdf_brief_summary_extracts_labeled_sections(self) -> None:
         settings = load_settings(FIXTURE_CONFIG_POE)
@@ -1882,7 +2310,7 @@ class MonitorPipelineTest(unittest.TestCase):
 
             db.close()
 
-    def test_generate_catalog_report_hides_unrequested_stored_variants(self) -> None:
+    def test_generate_catalog_report_merges_requested_and_stored_variants(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "config").mkdir(parents=True, exist_ok=True)
@@ -1983,10 +2411,10 @@ class MonitorPipelineTest(unittest.TestCase):
 
             self.assertIn("poe_gemini-3.1-pro", markdown)
             self.assertIn("ikun_gpt-5.4", markdown)
-            self.assertNotIn("legacy_model", markdown)
+            self.assertIn("legacy_model", markdown)
             self.assertIn("\"variant_id\": \"poe\"", export)
             self.assertIn("\"variant_id\": \"ikun\"", export)
-            self.assertNotIn("\"variant_id\": \"legacy\"", export)
+            self.assertIn("\"variant_id\": \"legacy\"", export)
 
             db.close()
 

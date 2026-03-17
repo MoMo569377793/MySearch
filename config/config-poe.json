@@ -72,7 +72,7 @@
     "api_key_env": "POE_API_KEY",
     "model": "claude-opus-4.6",
     "model_reasoning_effort": "",
-    "model_output_effort": "max",
+    "model_output_effort": "",
     "output_effort_by_task": {
       "pdf_brief": "max",
       "paper_summary": "max",
@@ -81,21 +81,18 @@
       "topic_digest": "max",
       "json_repair": "low"
     },
-    "timeout_seconds": 120,
+    "timeout_seconds": 180,
     "temperature": 0.2,
     "max_input_chars": 16000,
-    "max_output_tokens": 1400,
+    "max_output_tokens": 1800,
     "store": false,
-    "extra_body": {
-      "output_effort": "max"
-    },
     "enable_topic_digest": true,
-    "topic_digest_entry_limit": 8,
+    "topic_digest_entry_limit": 12,
     "fulltext_chunk_chars": 10000,
     "fulltext_chunk_overlap_chars": 1200,
     "fulltext_max_chunks": 12,
     "pdf_input_mode": "force",
-    "pdf_inline_max_bytes": 12582912
+    "pdf_inline_max_bytes": 20971520
   },
   "llm_variants": [],
   "topics": [

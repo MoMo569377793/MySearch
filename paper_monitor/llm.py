@@ -38,6 +38,66 @@ TASK_PAPER_CHUNK = "paper_chunk"
 TASK_PAPER_REDUCE = "paper_reduce"
 TASK_TOPIC_DIGEST = "topic_digest"
 TASK_JSON_REPAIR = "json_repair"
+DIRECT_PDF_INVALID_PATTERNS = [
+    "llm 未返回可用总结",
+    "未提供论文全文",
+    "没有提供论文全文",
+    "未附上论文全文",
+    "未收到论文全文",
+    "没有收到论文全文",
+    "当前对话中未提供论文全文",
+    "当前对话中未包含论文全文",
+    "当前未提供论文全文",
+    "缺少论文原文",
+    "没有收到论文",
+    "未收到论文",
+    "未提供论文",
+    "没有提供论文",
+    "请发送以下任一材料",
+    "请直接发送以下任一材料",
+    "请先提供原文材料",
+    "为避免臆测论文内容",
+    "一句话概括论文主旨",
+    "论文要解决的核心痛点、场景与挑战",
+]
+
+
+def looks_like_invalid_direct_pdf_text(text: str) -> bool:
+    normalized = THINK_TAG_RE.sub("", str(text or "")).strip().lower()
+    if not normalized:
+        return True
+    return any(pattern in normalized for pattern in DIRECT_PDF_INVALID_PATTERNS)
+
+
+def looks_like_invalid_direct_pdf_summary(parsed: dict[str, Any] | None, summary_text: str = "") -> bool:
+    if looks_like_invalid_direct_pdf_text(summary_text):
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    main_fields = [
+        str(parsed.get("summary", "") or "").strip(),
+        str(parsed.get("problem", "") or "").strip(),
+        str(parsed.get("method", "") or "").strip(),
+        str(parsed.get("application", "") or "").strip(),
+        str(parsed.get("results", "") or "").strip(),
+    ]
+    contributions = [str(item).strip() for item in parsed.get("contributions", []) if str(item).strip()]
+    limitations = [str(item).strip() for item in parsed.get("limitations", []) if str(item).strip()]
+    tags = [str(item).strip() for item in parsed.get("tags", []) if str(item).strip()]
+    candidate_parts = [
+        *main_fields,
+        " ".join(contributions),
+        " ".join(limitations),
+        " ".join(tags),
+    ]
+    combined = " ".join(str(item or "") for item in candidate_parts).strip()
+    if looks_like_invalid_direct_pdf_text(combined):
+        return True
+    substantive_fields = sum(1 for item in main_fields if len(item) >= 20)
+    total_chars = sum(len(item) for item in candidate_parts)
+    if substantive_fields < 2 and total_chars < 120:
+        return True
+    return False
 
 
 class LLMClient:
@@ -67,6 +127,7 @@ class LLMClient:
         pdf_path = self._resolve_local_pdf_path(paper)
         pdf_strategy = self._ensure_pdf_input_strategy(pdf_path)
         direct_pdf_status = ""
+        direct_pdf_failure_reason = ""
         if pdf_path and pdf_strategy:
             parsed, usage = self._generate_summary_from_pdf(paper, evaluations, pdf_path, pdf_strategy)
             if parsed:
@@ -77,8 +138,9 @@ class LLMClient:
                     pdf_strategy,
                 )
             else:
-                direct_pdf_status = "request_failed"
                 failure_reason = self._consume_last_request_failure()
+                direct_pdf_failure_reason = failure_reason
+                direct_pdf_status = self._status_from_direct_pdf_failure_reason(failure_reason)
                 LOGGER.warning(
                     "llm direct pdf summary failed for paper_id=%s model=%s via %s, reason=%s, fallback to extracted text",
                     paper.id,
@@ -175,6 +237,8 @@ class LLMClient:
                 parsed.setdefault("direct_pdf_strategy", pdf_strategy)
         if direct_pdf_status and parsed.get("source_mode") != "pdf_direct":
             parsed.setdefault("direct_pdf_status", direct_pdf_status)
+        if direct_pdf_failure_reason and parsed.get("source_mode") != "pdf_direct":
+            parsed.setdefault("direct_pdf_failure_reason", direct_pdf_failure_reason)
 
         parsed["usage"] = usage
         tags = unique_strings(parsed.get("tags", []))
@@ -421,31 +485,19 @@ class LLMClient:
         data_url = self._build_pdf_data_url(pdf_path)
         if not data_url:
             return None, {}
-        if pdf_strategy == PDF_STRATEGY_RESPONSES:
-            content, usage = self._post_responses_with_pdf(
-                system_prompt,
-                user_prompt,
-                schema_name,
-                schema,
-                pdf_filename=pdf_path.name,
-                pdf_data_url=data_url,
-                max_output_tokens=max_output_tokens,
-                task_name=task_name,
-            )
-        elif pdf_strategy in {PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE}:
-            content, usage = self._post_chat_completions_with_pdf(
-                system_prompt,
-                user_prompt,
-                schema_name,
-                schema,
-                pdf_filename=pdf_path.name,
-                pdf_data_url=data_url,
-                file_item_type="file" if pdf_strategy == PDF_STRATEGY_CHAT_FILE else "input_file",
-                max_output_tokens=max_output_tokens,
-                task_name=task_name,
-            )
-        else:
-            return None, {}
+        content, usage, final_strategy = self._post_structured_json_with_pdf_with_retry(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_name=schema_name,
+            schema=schema,
+            pdf_filename=pdf_path.name,
+            pdf_data_url=data_url,
+            pdf_strategy=pdf_strategy,
+            max_output_tokens=max_output_tokens,
+            task_name=task_name,
+        )
+        if final_strategy:
+            self._pdf_input_strategy = final_strategy
         if not content:
             return None, usage
         parsed = self._parse_response_json(content)
@@ -473,30 +525,182 @@ class LLMClient:
         data_url = self._build_pdf_data_url(pdf_path)
         if not data_url:
             return None, {}
-        if pdf_strategy == PDF_STRATEGY_RESPONSES:
-            content, usage = self._post_responses_text_with_pdf(
-                system_prompt,
-                user_prompt,
-                pdf_filename=pdf_path.name,
-                pdf_data_url=data_url,
+        content, usage, final_strategy = self._post_text_with_pdf_with_retry(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            pdf_filename=pdf_path.name,
+            pdf_data_url=data_url,
+            pdf_strategy=pdf_strategy,
+            max_output_tokens=max_output_tokens,
+            task_name=task_name,
+        )
+        if final_strategy:
+            self._pdf_input_strategy = final_strategy
+        if not content:
+            return None, usage
+        return THINK_TAG_RE.sub("", str(content)).strip() or None, usage
+
+    def _post_structured_json_with_pdf_with_retry(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_name: str,
+        schema: dict[str, Any],
+        pdf_filename: str,
+        pdf_data_url: str,
+        pdf_strategy: str,
+        max_output_tokens: int | None,
+        task_name: str,
+    ) -> tuple[str | None, dict[str, Any], str | None]:
+        content, usage = self._post_structured_json_with_pdf_once(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_name=schema_name,
+            schema=schema,
+            pdf_filename=pdf_filename,
+            pdf_data_url=pdf_data_url,
+            pdf_strategy=pdf_strategy,
+            max_output_tokens=max_output_tokens,
+            task_name=task_name,
+        )
+        if content:
+            return content, usage, pdf_strategy
+        alternate = self._alternate_pdf_strategy(pdf_strategy)
+        if alternate and self._should_retry_with_alternate_pdf_strategy(self._last_request_failure):
+            LOGGER.info(
+                "retrying pdf structured request for %s with alternate strategy %s after %s",
+                self.config.label or self.config.model or self.config.variant_id,
+                alternate,
+                shorten(self._last_request_failure, 160),
+            )
+            content, usage = self._post_structured_json_with_pdf_once(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema_name=schema_name,
+                schema=schema,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
+                pdf_strategy=alternate,
                 max_output_tokens=max_output_tokens,
                 task_name=task_name,
             )
-        elif pdf_strategy in {PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE}:
-            content, usage = self._post_chat_completions_text_with_pdf(
+            if content:
+                return content, usage, alternate
+        return content, usage, pdf_strategy
+
+    def _post_text_with_pdf_with_retry(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        pdf_filename: str,
+        pdf_data_url: str,
+        pdf_strategy: str,
+        max_output_tokens: int | None,
+        task_name: str,
+    ) -> tuple[str | None, dict[str, Any], str | None]:
+        content, usage = self._post_text_with_pdf_once(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            pdf_filename=pdf_filename,
+            pdf_data_url=pdf_data_url,
+            pdf_strategy=pdf_strategy,
+            max_output_tokens=max_output_tokens,
+            task_name=task_name,
+        )
+        if content:
+            return content, usage, pdf_strategy
+        alternate = self._alternate_pdf_strategy(pdf_strategy)
+        if alternate and self._should_retry_with_alternate_pdf_strategy(self._last_request_failure):
+            LOGGER.info(
+                "retrying pdf text request for %s with alternate strategy %s after %s",
+                self.config.label or self.config.model or self.config.variant_id,
+                alternate,
+                shorten(self._last_request_failure, 160),
+            )
+            content, usage = self._post_text_with_pdf_once(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
+                pdf_strategy=alternate,
+                max_output_tokens=max_output_tokens,
+                task_name=task_name,
+            )
+            if content:
+                return content, usage, alternate
+        return content, usage, pdf_strategy
+
+    def _post_structured_json_with_pdf_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_name: str,
+        schema: dict[str, Any],
+        pdf_filename: str,
+        pdf_data_url: str,
+        pdf_strategy: str,
+        max_output_tokens: int | None,
+        task_name: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        if pdf_strategy == PDF_STRATEGY_RESPONSES:
+            return self._post_responses_with_pdf(
                 system_prompt,
                 user_prompt,
-                pdf_filename=pdf_path.name,
-                pdf_data_url=data_url,
+                schema_name,
+                schema,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
+                max_output_tokens=max_output_tokens,
+                task_name=task_name,
+            )
+        if pdf_strategy in {PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE}:
+            return self._post_chat_completions_with_pdf(
+                system_prompt,
+                user_prompt,
+                schema_name,
+                schema,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
                 file_item_type="file" if pdf_strategy == PDF_STRATEGY_CHAT_FILE else "input_file",
                 max_output_tokens=max_output_tokens,
                 task_name=task_name,
             )
-        else:
-            return None, {}
-        if not content:
-            return None, usage
-        return THINK_TAG_RE.sub("", str(content)).strip() or None, usage
+        return None, {}
+
+    def _post_text_with_pdf_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        pdf_filename: str,
+        pdf_data_url: str,
+        pdf_strategy: str,
+        max_output_tokens: int | None,
+        task_name: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        if pdf_strategy == PDF_STRATEGY_RESPONSES:
+            return self._post_responses_text_with_pdf(
+                system_prompt,
+                user_prompt,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
+                max_output_tokens=max_output_tokens,
+                task_name=task_name,
+            )
+        if pdf_strategy in {PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE}:
+            return self._post_chat_completions_text_with_pdf(
+                system_prompt,
+                user_prompt,
+                pdf_filename=pdf_filename,
+                pdf_data_url=pdf_data_url,
+                file_item_type="file" if pdf_strategy == PDF_STRATEGY_CHAT_FILE else "input_file",
+                max_output_tokens=max_output_tokens,
+                task_name=task_name,
+            )
+        return None, {}
 
     def _repair_response_json(
         self,
@@ -1132,6 +1336,9 @@ class LLMClient:
             usage_items.append(usage)
         if not parsed:
             return None, self._merge_usage_items(usage_items)
+        parsed = self._reject_invalid_direct_pdf_result(parsed)
+        if not parsed:
+            return None, self._merge_usage_items(usage_items)
         parsed["source_mode"] = "pdf_direct"
         parsed["pdf_input_used"] = True
         parsed["pdf_filename"] = pdf_path.name
@@ -1162,6 +1369,9 @@ class LLMClient:
         usage_items.append(usage)
         if not brief_text:
             return None, self._merge_usage_items(usage_items)
+        if looks_like_invalid_direct_pdf_text(brief_text):
+            self._last_request_failure = "invalid_pdf_response:missing_context_or_empty_summary"
+            return None, self._merge_usage_items(usage_items)
 
         parsed = self._parse_pdf_brief_summary(brief_text)
         if parsed is None:
@@ -1180,11 +1390,14 @@ class LLMClient:
             usage_items.append(usage)
             if not parsed:
                 return None, self._merge_usage_items(usage_items)
+        parsed = self._reject_invalid_direct_pdf_result(parsed, summary_text=brief_text)
+        if not parsed:
+            return None, self._merge_usage_items(usage_items)
 
         parsed["source_mode"] = "pdf_direct"
         parsed["pdf_input_used"] = True
         parsed["pdf_filename"] = pdf_path.name
-        parsed["pdf_input_strategy"] = pdf_strategy
+        parsed["pdf_input_strategy"] = self._pdf_input_strategy or pdf_strategy
         parsed["direct_pdf_status"] = "used"
         parsed["basis"] = "llm+pdf+metadata"
         return parsed, self._merge_usage_items(usage_items)
@@ -1231,11 +1444,14 @@ class LLMClient:
             usage_items.append(usage)
         if not parsed:
             return None, self._merge_usage_items(usage_items)
+        parsed = self._reject_invalid_direct_pdf_result(parsed)
+        if not parsed:
+            return None, self._merge_usage_items(usage_items)
 
         parsed["source_mode"] = "pdf_direct"
         parsed["pdf_input_used"] = True
         parsed["pdf_filename"] = pdf_path.name
-        parsed["pdf_input_strategy"] = pdf_strategy
+        parsed["pdf_input_strategy"] = self._pdf_input_strategy or pdf_strategy
         parsed["direct_pdf_status"] = "used"
         return parsed, self._merge_usage_items(usage_items)
 
@@ -1267,15 +1483,41 @@ class LLMClient:
         self._last_request_failure = ""
         return value
 
+    def _status_from_direct_pdf_failure_reason(self, failure_reason: str) -> str:
+        reason = str(failure_reason or "").strip().lower()
+        if not reason:
+            return "request_failed"
+        if reason.startswith("pdf_too_large:"):
+            return "too_large"
+        if reason.startswith("invalid_pdf_response"):
+            return "invalid_response"
+        return "request_failed"
+
+    def _reject_invalid_direct_pdf_result(
+        self,
+        parsed: dict[str, Any] | None,
+        *,
+        summary_text: str = "",
+    ) -> dict[str, Any] | None:
+        if looks_like_invalid_direct_pdf_summary(parsed, summary_text):
+            self._last_request_failure = "invalid_pdf_response:missing_context_or_empty_summary"
+            return None
+        return parsed
+
     def _build_pdf_data_url(self, pdf_path: Path) -> str | None:
         try:
             pdf_bytes = pdf_path.read_bytes()
         except OSError as exc:
+            self._last_request_failure = f"read_pdf_failed:{exc}"
             LOGGER.warning("failed to read pdf for direct upload %s: %s", pdf_path, exc)
             return None
         if not pdf_bytes:
+            self._last_request_failure = "empty_pdf"
             return None
         if len(pdf_bytes) > self.config.pdf_inline_max_bytes:
+            self._last_request_failure = (
+                f"pdf_too_large:{len(pdf_bytes)}>{self.config.pdf_inline_max_bytes}"
+            )
             LOGGER.info(
                 "pdf direct input skipped for %s because file is too large (%s bytes > %s bytes)",
                 pdf_path.name,
@@ -1342,6 +1584,24 @@ class LLMClient:
         if self.provider in {"openai_responses", "openai", "responses"}:
             return [PDF_STRATEGY_RESPONSES]
         return [PDF_STRATEGY_CHAT_FILE, PDF_STRATEGY_CHAT_INPUT_FILE]
+
+    def _alternate_pdf_strategy(self, strategy: str | None) -> str | None:
+        if strategy == PDF_STRATEGY_CHAT_FILE:
+            return PDF_STRATEGY_CHAT_INPUT_FILE
+        if strategy == PDF_STRATEGY_CHAT_INPUT_FILE:
+            return PDF_STRATEGY_CHAT_FILE
+        return None
+
+    def _should_retry_with_alternate_pdf_strategy(self, failure_reason: str) -> bool:
+        reason = str(failure_reason or "").lower()
+        if not reason:
+            return False
+        if "unknown parameter" in reason or "unknown_parameter" in reason:
+            if ".file" in reason or "input_file" in reason or "type\":\"file\"" in reason:
+                return True
+        if "unsupported parameter" in reason and ("file" in reason or "input_file" in reason):
+            return True
+        return False
 
     def _chunk_fulltext(self, fulltext: str) -> list[str]:
         text = fulltext.strip()

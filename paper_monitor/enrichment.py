@@ -10,7 +10,7 @@ import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from paper_monitor.llm import LLMClient
+from paper_monitor.llm import LLMClient, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import EnrichmentConfig, PaperRecord, RunStats, Settings
 from paper_monitor.progress import ProgressBar
@@ -30,6 +30,7 @@ LOGGER = logging.getLogger(__name__)
 
 STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
 TEXT_LITERAL_RE = re.compile(r"\(([^()]*)\)")
+ARXIV_ID_RE = re.compile(r"(?:10\.48550/arxiv\.|arxiv\.org/(?:abs|pdf)/|abs/)(\d{4}\.\d{4,5}(?:v\d+)?)", re.I)
 
 
 def _llm_route_label(llm_result) -> str:  # noqa: ANN001
@@ -42,10 +43,22 @@ def _llm_route_label(llm_result) -> str:  # noqa: ANN001
     if source_mode == "pdf_direct":
         return f"PDF/{pdf_strategy or 'direct'}"
     if source_mode == "fulltext_txt":
-        if direct_pdf_status in {"unsupported", "request_failed", "disabled", "no_local_pdf"}:
+        if direct_pdf_status in {"unsupported", "request_failed", "disabled", "no_local_pdf", "too_large", "invalid_response"}:
             return f"全文回退/{direct_pdf_status}"
         return "全文"
     return "摘要"
+
+
+def _summary_has_complete_pdf_output(summary) -> bool:  # noqa: ANN001
+    if summary is None:
+        return False
+    structured = summary.structured if isinstance(getattr(summary, "structured", None), dict) else {}
+    source_mode = str(structured.get("source_mode", "")).strip().lower()
+    direct_pdf_status = str(structured.get("direct_pdf_status", "")).strip().lower()
+    summary_text = str(getattr(summary, "summary_text", "") or "").strip()
+    if not summary_text or source_mode != "pdf_direct" or direct_pdf_status not in {"", "used"}:
+        return False
+    return not looks_like_invalid_direct_pdf_summary(structured, summary_text)
 
 
 @dataclass(slots=True)
@@ -85,10 +98,15 @@ class DocumentProcessor:
     def resolve_pdf_url(self, paper: PaperRecord) -> str:
         if self._looks_like_pdf_url(paper.pdf_url):
             return paper.pdf_url
+        inferred_arxiv_id = self._infer_arxiv_id(paper)
+        if inferred_arxiv_id:
+            return f"https://arxiv.org/pdf/{inferred_arxiv_id}.pdf"
         if paper.arxiv_id:
             return f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
         if "/abs/" in paper.primary_url and "arxiv.org" in paper.primary_url:
             return paper.primary_url.replace("/abs/", "/pdf/") + ".pdf"
+        if self._should_try_primary_url_as_pdf_candidate(paper):
+            return paper.primary_url.strip()
         return ""
 
     def enrich(self, paper: PaperRecord, force: bool = False) -> DocumentArtifacts:
@@ -113,8 +131,22 @@ class DocumentProcessor:
 
         if force or self.config.redownload_existing or not pdf_path.exists():
             downloaded_at = now_iso(self.timezone_name)
-            self._download_pdf(pdf_url, pdf_path)
-            was_downloaded = True
+            try:
+                self._download_pdf(pdf_url, pdf_path)
+                was_downloaded = True
+            except ValueError as exc:
+                LOGGER.warning("pdf candidate rejected for paper_id=%s url=%s: %s", paper.id, pdf_url, exc)
+                return DocumentArtifacts(
+                    pdf_local_path=paper.pdf_local_path,
+                    pdf_status="no-pdf",
+                    pdf_downloaded_at=paper.pdf_downloaded_at,
+                    fulltext_txt_path=paper.fulltext_txt_path,
+                    fulltext_excerpt=paper.fulltext_excerpt,
+                    fulltext_status=paper.fulltext_status or "empty",
+                    page_count=paper.page_count,
+                    was_downloaded=False,
+                    was_extracted=False,
+                )
 
         page_count = self._extract_page_count(pdf_path) if pdf_path.exists() else paper.page_count
 
@@ -156,10 +188,46 @@ class DocumentProcessor:
             return True
         return "/pdf/" in lowered
 
+    def _infer_arxiv_id(self, paper: PaperRecord) -> str:
+        candidates = [
+            paper.arxiv_id,
+            paper.pdf_url,
+            paper.primary_url,
+            paper.doi,
+        ]
+        if isinstance(paper.metadata, dict) and paper.metadata:
+            candidates.append(str(paper.metadata))
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            match = ARXIV_ID_RE.search(text)
+            if match:
+                return match.group(1)
+        return ""
+
+    def _should_try_primary_url_as_pdf_candidate(self, paper: PaperRecord) -> bool:
+        url = paper.primary_url.strip()
+        if not url:
+            return False
+        lowered = url.lower()
+        if self._looks_like_pdf_url(lowered):
+            return True
+        if "doi.org/" in lowered and "10.48550/arxiv." not in lowered:
+            return False
+        metadata_text = str(paper.metadata or "").lower()
+        if "'access': 'open'" in metadata_text or '"access": "open"' in metadata_text:
+            return True
+        return not lowered.startswith("https://doi.org/")
+
     def _download_pdf(self, url: str, destination: Path) -> None:
         request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         with urllib.request.urlopen(request, timeout=self.config.download_timeout_seconds) as response:
-            destination.write_bytes(response.read())
+            payload = response.read()
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if not payload.startswith(b"%PDF") and "application/pdf" not in content_type:
+                raise ValueError(f"candidate url did not return a pdf document: {url}")
+            destination.write_bytes(payload)
 
     def _extract_page_count(self, pdf_path: Path) -> int | None:
         if not self.has_pdfinfo:
@@ -357,12 +425,9 @@ class EnrichmentPipeline:
                 progress_bar.advance(detail=f"跳过 {title}")
                 continue
             evaluations = self.db.fetch_paper_evaluations(paper.id)
-            existing_variant_ids = self.db.fetch_paper_llm_variant_ids(paper.id) if use_llm and not force else set()
-            active_variants = [
-                variant
-                for variant in target_variants
-                if use_llm and variant.client.enabled and (force or variant.variant_id not in existing_variant_ids)
-            ]
+            active_variants = (
+                self._select_variants_needing_refresh(paper.id, target_variants, force=force) if use_llm else []
+            )
             jobs.append((paper, evaluations, active_variants, title))
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -381,6 +446,7 @@ class EnrichmentPipeline:
                 )
                 for paper, evaluations, active_variants, title in jobs
             }
+            progress_bar.start_pulse(f"并发处理中 {len(future_map)} 篇论文")
             for future in as_completed(future_map):
                 paper, title = future_map[future]
                 try:
@@ -412,6 +478,7 @@ class EnrichmentPipeline:
                     LOGGER.warning("enrichment failed for paper_id=%s: %s", paper.id, exc)
                     stats.errors.append(f"paper:{paper.id}:{exc}")
                     progress_bar.advance(detail=f"失败 {title}")
+            progress_bar.stop_pulse()
 
         progress_bar.close(
             f"增强完成 {stats.enriched} 篇, LLM 总结 {stats.llm_summaries} 条, 跳过 {stats.skipped} 篇"
@@ -431,6 +498,26 @@ class EnrichmentPipeline:
                 continue
             llm_results.append((variant, llm_result))
         return llm_results
+
+    def _select_variants_needing_refresh(
+        self,
+        paper_id: int,
+        target_variants: list[LLMRuntimeVariant],
+        *,
+        force: bool,
+    ) -> list[LLMRuntimeVariant]:
+        if force:
+            return [variant for variant in target_variants if variant.client.enabled]
+        summary_map = self.db.fetch_paper_llm_summary_map(paper_id)
+        selected: list[LLMRuntimeVariant] = []
+        for variant in target_variants:
+            if not variant.client.enabled:
+                continue
+            summary = summary_map.get(variant.variant_id)
+            if _summary_has_complete_pdf_output(summary):
+                continue
+            selected.append(variant)
+        return selected
 
     def _process_paper_job(
         self,
@@ -550,10 +637,13 @@ class EnrichmentPipeline:
             and paper.fulltext_status != "extracted"
         )
         needs_pdf_state_refresh = not skip_document_processing and paper.pdf_status == "pending"
-        existing_variant_ids = self.db.fetch_paper_llm_variant_ids(paper.id) if use_llm else set()
         effective_variants = target_variants if target_variants is not None else self.llm_variants
-        target_variant_ids = {variant.variant_id for variant in effective_variants if variant.client.enabled}
-        needs_llm = use_llm and bool(target_variant_ids - existing_variant_ids)
+        refresh_variants = (
+            self._select_variants_needing_refresh(paper.id, effective_variants, force=False)
+            if use_llm
+            else []
+        )
+        needs_llm = use_llm and bool(refresh_variants)
         needs_offline_refresh = (
             not use_llm
             and paper.fulltext_status == "extracted"
@@ -577,7 +667,12 @@ class EnrichmentPipeline:
         if not skip_document_processing and (force or paper.fulltext_status != "extracted" or paper.pdf_status == "pending"):
             if progress_bar:
                 progress_bar.set_detail(f"下载/抽取 {title}")
-            artifacts = self.document_processor.enrich(paper, force=force)
+                progress_bar.start_pulse(f"下载/抽取 {title}")
+            try:
+                artifacts = self.document_processor.enrich(paper, force=force)
+            finally:
+                if progress_bar:
+                    progress_bar.stop_pulse(f"完成下载/抽取 {title}")
             self.db.update_paper_assets(
                 paper.id,
                 pdf_local_path=artifacts.pdf_local_path,
@@ -597,19 +692,22 @@ class EnrichmentPipeline:
             progress_bar.set_detail(f"跳过 PDF，直接总结 {title}")
 
         evaluations = self.db.fetch_paper_evaluations(paper.id)
-        existing_variant_ids = self.db.fetch_paper_llm_variant_ids(paper.id) if use_llm and not force else set()
         llm_results = []
         if use_llm:
             candidate_variants = target_variants if target_variants is not None else self.llm_variants
-            for variant in candidate_variants:
-                if not variant.client.enabled:
-                    continue
-                if not force and variant.variant_id in existing_variant_ids:
-                    continue
+            active_variants = self._select_variants_needing_refresh(paper.id, candidate_variants, force=force)
+            for variant in active_variants:
                 if progress_bar:
                     progress_bar.set_detail(f"{title} -> {variant.label}")
-                llm_result = variant.client.generate_summary(paper, evaluations)
+                    progress_bar.start_pulse(f"{title} -> {variant.label}")
+                try:
+                    llm_result = variant.client.generate_summary(paper, evaluations)
+                finally:
+                    if progress_bar:
+                        progress_bar.stop_pulse(f"{title} -> {variant.label}")
                 if llm_result is None:
+                    if progress_bar:
+                        progress_bar.set_detail(f"{title} -> {variant.label} [未生成]")
                     continue
                 if progress_bar:
                     progress_bar.set_detail(f"{title} -> {variant.label} [{_llm_route_label(llm_result)}]")

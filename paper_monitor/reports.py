@@ -347,6 +347,10 @@ def _summary_scope_note(summary: PaperLLMSummary) -> str:
                 f" 直接 PDF 请求失败{f'（策略 `{pdf_strategy}`）' if pdf_strategy else ''}，"
                 "因此回退到全文文本模式。"
             )
+        elif direct_pdf_status == "too_large":
+            fallback_text = " 本地 PDF 超过直传大小限制，因此回退到全文文本模式。"
+        elif direct_pdf_status == "invalid_response":
+            fallback_text = " 直接 PDF 返回了无效内容，因此回退到全文文本模式。"
         elif direct_pdf_status == "disabled":
             fallback_text = " 当前配置已禁用直接 PDF 输入，因此回退到全文文本模式。"
         elif direct_pdf_status == "no_local_pdf":
@@ -366,6 +370,10 @@ def _summary_scope_note(summary: PaperLLMSummary) -> str:
             f"本次总结没有读取完整全文，只基于标题、摘要和元数据。"
             f" 直接 PDF 请求失败{f'（策略 `{pdf_strategy}`）' if pdf_strategy else ''}。"
         ).strip()
+    if direct_pdf_status == "too_large":
+        return "本次总结没有读取完整全文，只基于标题、摘要和元数据。本地 PDF 超过直传大小限制。"
+    if direct_pdf_status == "invalid_response":
+        return "本次总结没有读取完整全文，只基于标题、摘要和元数据。直接 PDF 返回了无效内容。"
     if direct_pdf_status == "disabled":
         return "本次总结没有读取完整全文，只基于标题、摘要和元数据。当前配置已禁用直接 PDF 输入。"
     if direct_pdf_status == "no_local_pdf":
@@ -493,7 +501,8 @@ def _resolve_display_variants(
 ) -> tuple[list[LLMRuntimeVariant | dict], dict[int, list[PaperLLMSummary]]]:
     requested_variants = list(variants)
     if requested_variants:
-        return requested_variants, _filter_summaries_by_variants(paper_summaries_by_paper, requested_variants)
+        merged = _merge_variants_with_stored_summaries(requested_variants, paper_summaries_by_paper)
+        return merged, _filter_summaries_by_variants(paper_summaries_by_paper, merged)
     return _merge_variants_with_stored_summaries([], paper_summaries_by_paper), paper_summaries_by_paper
 
 
