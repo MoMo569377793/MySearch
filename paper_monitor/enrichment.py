@@ -56,9 +56,19 @@ def _summary_has_complete_pdf_output(summary) -> bool:  # noqa: ANN001
     source_mode = str(structured.get("source_mode", "")).strip().lower()
     direct_pdf_status = str(structured.get("direct_pdf_status", "")).strip().lower()
     summary_text = str(getattr(summary, "summary_text", "") or "").strip()
+    summary_basis = str(getattr(summary, "summary_basis", "") or "").strip().lower()
+    structured_basis = str(structured.get("basis", "") or "").strip().lower()
     if not summary_text or source_mode != "pdf_direct" or direct_pdf_status not in {"", "used"}:
         return False
+    if summary_basis != "llm+pdf+metadata":
+        return False
+    if structured_basis and structured_basis != "llm+pdf+metadata":
+        return False
     return not looks_like_invalid_direct_pdf_summary(structured, summary_text)
+
+
+def _normalize_variant_lookup_key(value: str) -> str:
+    return str(value or "").strip().lower()
 
 
 @dataclass(slots=True)
@@ -325,6 +335,8 @@ class EnrichmentPipeline:
         secondary_priority_only: bool = False,
         secondary_top_per_topic: int = 3,
         secondary_min_score: float = 24.0,
+        retry_from_variant: str | None = None,
+        retry_from_status: str = "incomplete",
     ) -> RunStats:
         stats = RunStats()
         if not self.settings.enrichment.enabled and not force:
@@ -334,13 +346,23 @@ class EnrichmentPipeline:
         effective_limit = limit or self.settings.enrichment.max_papers_per_run
         if paper_ids:
             effective_limit = max(effective_limit, len(set(paper_ids)))
+        fetch_limit = effective_limit
+        if retry_from_variant and not paper_ids:
+            fetch_limit = max(effective_limit * 10, 2000)
         candidates = self.db.fetch_enrichment_candidates(
-            limit=effective_limit,
+            limit=fetch_limit,
             classifications=selected_classifications,
             topic_ids=topic_ids,
             created_after=created_after,
             paper_ids=paper_ids,
         )
+        if retry_from_variant:
+            candidates = self._filter_candidates_by_reference_variant(
+                candidates,
+                reference_variant=retry_from_variant,
+                retry_status=retry_from_status,
+            )
+            candidates = candidates[:effective_limit]
         progress_bar = ProgressBar("增强", len(candidates) or 1)
         enabled_variants = [variant for variant in self.llm_variants if variant.client.enabled]
         use_llm_effective = bool(enabled_variants) if use_llm is None else (use_llm and bool(enabled_variants))
@@ -557,6 +579,56 @@ class EnrichmentPipeline:
             llm_results=llm_results,
             artifacts=artifacts,
         )
+
+    def _filter_candidates_by_reference_variant(
+        self,
+        candidates: list[PaperRecord],
+        *,
+        reference_variant: str,
+        retry_status: str,
+    ) -> list[PaperRecord]:
+        if not candidates:
+            return candidates
+        normalized_reference = _normalize_variant_lookup_key(reference_variant)
+        if not normalized_reference:
+            return candidates
+        summary_map = self.db.fetch_paper_llm_summaries([paper.id for paper in candidates])
+        filtered: list[PaperRecord] = []
+        for paper in candidates:
+            reference_summary = self._find_reference_variant_summary(
+                summary_map.get(paper.id, []),
+                normalized_reference,
+            )
+            if self._matches_retry_reference_status(reference_summary, retry_status):
+                filtered.append(paper)
+        LOGGER.info(
+            "retry-from-variant filter applied: variant=%s status=%s kept=%s/%s",
+            reference_variant,
+            retry_status,
+            len(filtered),
+            len(candidates),
+        )
+        return filtered
+
+    def _find_reference_variant_summary(
+        self,
+        summaries,
+        normalized_reference: str,
+    ):
+        for summary in summaries:
+            if _normalize_variant_lookup_key(summary.variant_id) == normalized_reference:
+                return summary
+            if _normalize_variant_lookup_key(summary.variant_label) == normalized_reference:
+                return summary
+        return None
+
+    def _matches_retry_reference_status(self, summary, retry_status: str) -> bool:  # noqa: ANN001
+        normalized_status = str(retry_status or "incomplete").strip().lower()
+        if normalized_status == "missing":
+            return summary is None
+        if normalized_status == "fallback":
+            return summary is not None and not _summary_has_complete_pdf_output(summary)
+        return summary is None or not _summary_has_complete_pdf_output(summary)
 
     def _persist_paper_results(
         self,

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 from pathlib import Path
 
 from paper_monitor.config import load_settings
-from paper_monitor.enrichment import DocumentArtifacts, DocumentProcessor, EnrichmentPipeline
+from paper_monitor.enrichment import (
+    DocumentArtifacts,
+    DocumentProcessor,
+    EnrichmentPipeline,
+    _summary_has_complete_pdf_output,
+)
 from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import FetchPlan, LLMResult
@@ -23,6 +31,22 @@ FIXTURE_CONFIG_POE = REPO_ROOT / "config" / "config-poe.json"
 
 
 class MonitorPipelineTest(unittest.TestCase):
+    def test_complete_pdf_output_requires_pdf_basis(self) -> None:
+        summary = type(
+            "Summary",
+            (),
+            {
+                "summary_text": "问题：A 方法：B 应用：C 结果：D",
+                "summary_basis": "llm+abstract+metadata",
+                "structured": {
+                    "source_mode": "pdf_direct",
+                    "direct_pdf_status": "used",
+                    "basis": "llm+abstract+metadata",
+                },
+            },
+        )()
+        self.assertFalse(_summary_has_complete_pdf_output(summary))
+
     def test_since_last_run_only_processes_new_papers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -730,6 +754,153 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(fake_llm.titles, ["Newer FlashAttention Paper"])
             db.close()
 
+    def test_enrichment_can_retry_only_reference_variant_fallback_or_missing_papers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_POE.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.base_url = "http://example.invalid/v1"
+            settings.llm.model = "dummy-model"
+
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            for index in range(1, 4):
+                pipeline._process_candidate(
+                    PaperCandidate(
+                        source_name="arxiv",
+                        source_paper_id=f"2503.0000{index}",
+                        query_text="matrix-free finite element",
+                        title=f"Retry Reference Sample {index}",
+                        abstract="matrix-free finite element operator application on GPUs",
+                        authors=["Alice"],
+                        published_at=f"2026-03-10T0{index}:00:00+08:00",
+                        updated_at=f"2026-03-10T0{index}:00:00+08:00",
+                        primary_url=f"https://arxiv.org/abs/2503.0000{index}",
+                        pdf_url=f"https://arxiv.org/pdf/2503.0000{index}.pdf",
+                        doi="",
+                        arxiv_id=f"2503.0000{index}",
+                        venue="arXiv",
+                        year=2026,
+                        categories=["cs.DC"],
+                        raw={"fixture": True},
+                    ),
+                    RunStats(),
+                )
+
+            db.upsert_paper_llm_summary(
+                1,
+                variant_id="ikun",
+                variant_label="ikun_gpt-5.4",
+                provider="IkunCoding",
+                base_url="https://api.ikuncode.cc/v1",
+                model="gpt-5.4",
+                summary_text=(
+                    "问题：高阶有限元 matrix-free 算子在 GPU 上面临访存瓶颈。"
+                    "方法：论文基于完整 PDF 说明了 partial assembly、kernel fusion 与向量化实现。"
+                    "应用：面向高性能科学计算。结果：给出了明确的性能收益与扩展性数据。"
+                ),
+                summary_basis="llm+pdf+metadata",
+                tags=["matrix-free"],
+                structured={
+                    "summary": "论文基于完整 PDF 解释了 matrix-free 有限元算子在 GPU 上的优化方法和结果。",
+                    "problem": "高阶有限元 matrix-free 算子在 GPU 上容易受访存和带宽瓶颈限制。",
+                    "method": "结合 partial assembly、kernel fusion 和向量化布局优化实现高效算子应用。",
+                    "application": "面向高性能科学计算中的高阶有限元求解与矩阵自由预条件过程。",
+                    "results": "给出了可量化的性能收益、吞吐提升和可扩展性实验结果。",
+                    "source_mode": "pdf_direct",
+                    "direct_pdf_status": "used",
+                    "basis": "llm+pdf+metadata",
+                },
+                usage={},
+            )
+            db.upsert_paper_llm_summary(
+                2,
+                variant_id="ikun",
+                variant_label="ikun_gpt-5.4",
+                provider="IkunCoding",
+                base_url="https://api.ikuncode.cc/v1",
+                model="gpt-5.4",
+                summary_text="回退到全文文本的总结",
+                summary_basis="llm+fulltext+metadata",
+                tags=["matrix-free"],
+                structured={
+                    "summary": "回退到全文文本的总结",
+                    "source_mode": "fulltext_txt",
+                    "direct_pdf_status": "too_large",
+                    "basis": "llm+fulltext+metadata",
+                },
+                usage={},
+            )
+
+            class FakePoeClient:
+                enabled = True
+
+                def __init__(self) -> None:
+                    self.paper_ids: list[int] = []
+
+                def generate_summary(self, paper, evaluations):  # noqa: ANN001, ARG002
+                    self.paper_ids.append(paper.id)
+                    return LLMResult(
+                        summary_text=f"Poe summary for {paper.title}",
+                        summary_basis="llm+abstract+metadata",
+                        tags=["retry"],
+                        structured={"summary": paper.title, "source_mode": "abstract_metadata"},
+                    )
+
+            fake_poe = FakePoeClient()
+            variants = [
+                LLMRuntimeVariant(
+                    variant_id="poe",
+                    label="poe_claude-opus-4.6",
+                    provider="openai_compatible",
+                    base_url="https://api.poe.com/v1",
+                    model="claude-opus-4.6",
+                    config_path=root / "config" / "config-poe.json",
+                    client=fake_poe,
+                )
+            ]
+            enrichment_pipeline = EnrichmentPipeline(settings, db, llm_variants=variants)
+            candidates = db.fetch_enrichment_candidates(limit=10, classifications=["relevant", "maybe"])
+
+            filtered_incomplete = enrichment_pipeline._filter_candidates_by_reference_variant(  # noqa: SLF001
+                candidates,
+                reference_variant="ikun",
+                retry_status="incomplete",
+            )
+            filtered_fallback = enrichment_pipeline._filter_candidates_by_reference_variant(  # noqa: SLF001
+                candidates,
+                reference_variant="ikun_gpt-5.4",
+                retry_status="fallback",
+            )
+            filtered_missing = enrichment_pipeline._filter_candidates_by_reference_variant(  # noqa: SLF001
+                candidates,
+                reference_variant="ikun",
+                retry_status="missing",
+            )
+
+            self.assertEqual({paper.id for paper in filtered_incomplete}, {2, 3})
+            self.assertEqual({paper.id for paper in filtered_fallback}, {2})
+            self.assertEqual({paper.id for paper in filtered_missing}, {3})
+
+            stats = enrichment_pipeline.run(
+                limit=10,
+                use_llm=True,
+                skip_document_processing=True,
+                retry_from_variant="ikun",
+                retry_from_status="incomplete",
+            )
+
+            self.assertEqual(stats.enriched, 2)
+            self.assertEqual(stats.llm_summaries, 2)
+            self.assertEqual(set(fake_poe.paper_ids), {2, 3})
+            db.close()
+
     def test_llm_summary_reads_fulltext_txt_and_uses_map_reduce(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -860,6 +1031,94 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertTrue(any("LATE_SECTION_MARKER" in prompt for _, prompt in client.calls))
             self.assertIn("应用：高阶有限元", result.summary_text)
             self.assertGreaterEqual(int(result.structured.get("chunk_count", 0)), 2)
+
+    def test_llm_summary_preserves_abstract_basis_even_when_fulltext_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            settings.llm.enabled = True
+            settings.llm.provider = "openai_compatible"
+            settings.llm.base_url = "https://example.invalid/v1"
+            settings.llm.model = "claude-opus-4.6"
+            settings.llm.api_key_env = ""
+            settings.llm.pdf_input_mode = "disable"
+
+            fulltext_path = root / "artifacts" / "text" / "paper.txt"
+            fulltext_path.parent.mkdir(parents=True, exist_ok=True)
+            fulltext_path.write_text("fulltext exists", encoding="utf-8")
+
+            paper = PaperRecord(
+                id=1,
+                title="Abstract only summary",
+                title_norm="abstract only summary",
+                abstract="This abstract is relevant.",
+                authors=["Alice"],
+                published_at="2026-03-01T00:00:00+08:00",
+                updated_at="2026-03-01T00:00:00+08:00",
+                primary_url="https://example.invalid/paper",
+                pdf_url="https://example.invalid/paper.pdf",
+                doi="",
+                arxiv_id="",
+                venue="",
+                year=2026,
+                categories=["cs.LG"],
+                summary_text="",
+                summary_basis="",
+                tags=[],
+                pdf_local_path="",
+                pdf_status="missing",
+                pdf_downloaded_at=None,
+                fulltext_txt_path=str(fulltext_path),
+                fulltext_excerpt="fulltext excerpt",
+                fulltext_status="extracted",
+                page_count=None,
+                llm_summary={},
+                analysis_updated_at="2026-03-01T00:00:00+08:00",
+                source_first="manual",
+                created_at="2026-03-01T00:00:00+08:00",
+                last_seen_at="2026-03-01T00:00:00+08:00",
+                metadata={},
+            )
+            evaluations = [
+                TopicEvaluation(
+                    topic_id="ai_operator_acceleration",
+                    topic_name="AI 算子加速",
+                    score=25,
+                    classification="relevant",
+                    matched_keywords=["compiler", "deep learning"],
+                    reasons=[],
+                )
+            ]
+
+            class AbstractOnlyClient(LLMClient):
+                def _generate_summary_from_fulltext(self, paper, evaluations, fulltext):  # noqa: ANN001, ARG002
+                    return None, {}
+
+                def _request_structured_json(self, **kwargs):  # noqa: ANN003
+                    return (
+                        {
+                            "summary": "只基于摘要和元数据生成总结。",
+                            "problem": "问题描述。",
+                            "method": "方法描述。",
+                            "application": "应用描述。",
+                            "results": "结果描述。",
+                            "contributions": ["贡献"],
+                            "limitations": ["局限"],
+                            "tags": ["tag"],
+                            "source_mode": "abstract_metadata",
+                        },
+                        {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                    )
+
+            client = AbstractOnlyClient(settings.llm)
+            result = client.generate_summary(paper, evaluations)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.summary_basis, "llm+abstract+metadata")
+            self.assertEqual(result.structured.get("source_mode"), "abstract_metadata")
 
     def test_llm_summary_prefers_direct_pdf_when_backend_supports_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1655,6 +1914,161 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(extra_body.get("output_effort"), "max")
             self.assertNotIn("reasoning_effort", extra_body)
             self.assertNotIn("reasoning_effort", client.payloads[0])
+
+    def test_poe_claude_preserves_low_output_effort(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_POE)
+        settings.llm.enabled = True
+        settings.llm.api_key_env = ""
+        settings.llm.model = "claude-opus-4.6"
+        settings.llm.output_effort_by_task = {"paper_chunk": "low"}
+        settings.llm.model_output_effort = "max"
+
+        class CaptureClient(LLMClient):
+            def __init__(self, config):  # noqa: ANN001
+                super().__init__(config)
+                self.payloads: list[dict] = []
+
+            def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                self.payloads.append(payload)
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        client = CaptureClient(settings.llm)
+        text, _ = client._post_chat_completions_text("sys", "user", task_name="paper_chunk")
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.payloads[0].get("extra_body", {}).get("output_effort"), "low")
+
+    def test_poe_claude_enforces_min_output_budget_when_output_effort_is_enabled(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_POE)
+        settings.llm.enabled = True
+        settings.llm.model = "claude-opus-4.6"
+        settings.llm.model_output_effort = "max"
+        settings.llm.output_effort_by_task = {"paper_chunk": "low"}
+        settings.llm.max_output_tokens_by_task = {"paper_chunk": 800}
+
+        client = LLMClient(settings.llm)
+
+        self.assertEqual(client._max_output_tokens_for_task("paper_chunk"), 1200)  # noqa: SLF001
+        self.assertEqual(client._max_output_tokens_for_task("paper_chunk", maximum=900), 1200)  # noqa: SLF001
+
+    def test_poe_claude_payload_raises_explicit_low_token_budget_to_minimum(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_POE)
+        settings.llm.enabled = True
+        settings.llm.api_key_env = ""
+        settings.llm.model = "claude-opus-4.6"
+        settings.llm.model_output_effort = "max"
+        settings.llm.output_effort_by_task = {"paper_summary": "max"}
+
+        class CaptureClient(LLMClient):
+            def __init__(self, config):  # noqa: ANN001
+                super().__init__(config)
+                self.payloads: list[dict] = []
+
+            def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                self.payloads.append(payload)
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        client = CaptureClient(settings.llm)
+        text, _ = client._post_chat_completions_text(
+            "sys",
+            "user",
+            max_output_tokens=800,
+            task_name="paper_summary",
+        )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.payloads[0].get("max_tokens"), 1200)
+
+    def test_poe_claude_none_output_effort_does_not_raise_token_budget(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_POE)
+        settings.llm.enabled = True
+        settings.llm.api_key_env = ""
+        settings.llm.model = "claude-opus-4.6"
+        settings.llm.model_output_effort = ""
+        settings.llm.output_effort_by_task = {"paper_chunk": "none"}
+
+        class CaptureClient(LLMClient):
+            def __init__(self, config):  # noqa: ANN001
+                super().__init__(config)
+                self.payloads: list[dict] = []
+
+            def _post_json(self, url, payload, warn_on_error=True):  # noqa: ANN001, ARG002
+                self.payloads.append(payload)
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        client = CaptureClient(settings.llm)
+        text, _ = client._post_chat_completions_text(
+            "sys",
+            "user",
+            max_output_tokens=800,
+            task_name="paper_chunk",
+        )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(client.payloads[0].get("extra_body", {}).get("output_effort"), "none")
+        self.assertEqual(client.payloads[0].get("max_tokens"), 800)
+
+    def test_post_json_retries_http_524(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        settings.llm.enabled = True
+        settings.llm.base_url = "https://example.invalid/v1"
+        settings.llm.model = "gpt-5.4"
+        settings.llm.api_key_env = ""
+        client = LLMClient(settings.llm)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        transient_524 = urllib.error.HTTPError(
+            url="https://example.invalid/v1/chat/completions",
+            code=524,
+            msg="upstream timeout",
+            hdrs=None,
+            fp=io.BytesIO(b"error code: 524"),
+        )
+
+        with mock.patch(
+            "paper_monitor.llm.urllib.request.urlopen",
+            side_effect=[transient_524, FakeResponse()],
+        ) as mocked_urlopen, mock.patch("paper_monitor.llm.time.sleep", return_value=None):
+            result = client._post_json(
+                "https://example.invalid/v1/chat/completions",
+                {"model": "gpt-5.4", "messages": [{"role": "user", "content": "hello"}]},
+                warn_on_error=False,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        self.assertEqual(client._last_request_failure, "")
+
+    def test_eof_failure_retries_alternate_pdf_strategy(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_POE)
+        settings.llm.enabled = True
+        settings.llm.api_key_env = ""
+        settings.llm.model = "claude-opus-4.6"
+        client = LLMClient(settings.llm)
+
+        self.assertTrue(
+            client._should_retry_with_alternate_pdf_strategy(  # noqa: SLF001
+                "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)>"
+            )
+        )
 
     def test_topic_digest_can_override_reasoning_by_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

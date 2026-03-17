@@ -26,8 +26,9 @@ from paper_monitor.utils import shorten, unique_strings
 
 LOGGER = logging.getLogger(__name__)
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 524}
 DEFAULT_LLM_USER_AGENT = "paper-monitor/0.1 (+local)"
+POE_CLAUDE_THINKING_MIN_OUTPUT_TOKENS = 1200
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 PDF_STRATEGY_RESPONSES = "responses_input_file"
 PDF_STRATEGY_CHAT_FILE = "chat_file"
@@ -351,11 +352,14 @@ class LLMClient:
     def _output_effort_for_task(self, task_name: str) -> str:
         task_value = str(self.config.output_effort_by_task.get(task_name, "")).strip()
         if task_value:
-            return task_value
-        global_value = str(self.config.model_output_effort).strip()
-        if global_value:
-            return global_value
-        return str(self.config.extra_body.get("output_effort", "")).strip()
+            resolved = task_value
+        else:
+            global_value = str(self.config.model_output_effort).strip()
+            if global_value:
+                resolved = global_value
+            else:
+                resolved = str(self.config.extra_body.get("output_effort", "")).strip()
+        return resolved
 
     def _max_output_tokens_for_task(
         self,
@@ -370,6 +374,9 @@ class LLMClient:
             value = max(value, int(minimum))
         if maximum is not None:
             value = min(value, int(maximum))
+        output_effort = self._output_effort_for_task(task_name).strip().lower()
+        if self._is_poe_api() and self._is_claude_model() and output_effort and output_effort != "none":
+            value = max(value, POE_CLAUDE_THINKING_MIN_OUTPUT_TOKENS)
         return value
 
     def _is_poe_api(self) -> bool:
@@ -408,6 +415,7 @@ class LLMClient:
         elif reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
 
+        payload = self._ensure_min_output_budget(payload, task_name=task_name)
         if extra_body:
             payload["extra_body"] = extra_body
         return payload
@@ -416,6 +424,18 @@ class LLMClient:
         reasoning_effort = self._reasoning_effort_for_task(task_name)
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
+        return self._ensure_min_output_budget(payload, task_name=task_name)
+
+    def _ensure_min_output_budget(self, payload: dict[str, Any], *, task_name: str) -> dict[str, Any]:
+        output_effort = self._output_effort_for_task(task_name).strip().lower()
+        if not (self._is_poe_api() and self._is_claude_model() and output_effort and output_effort != "none"):
+            return payload
+        for key in ("max_tokens", "max_output_tokens"):
+            if key in payload:
+                try:
+                    payload[key] = max(int(payload[key]), POE_CLAUDE_THINKING_MIN_OUTPUT_TOKENS)
+                except (TypeError, ValueError):
+                    pass
         return payload
 
     def _request_structured_json(
@@ -1652,6 +1672,8 @@ class LLMClient:
                 return True
         if "unsupported parameter" in reason and ("file" in reason or "input_file" in reason):
             return True
+        if "unexpected_eof_while_reading" in reason or "eof occurred in violation of protocol" in reason:
+            return True
         return False
 
     def _chunk_fulltext(self, fulltext: str) -> list[str]:
@@ -2010,6 +2032,10 @@ class LLMClient:
             return value
         if source_mode == "pdf_direct":
             return "llm+pdf+metadata"
+        if source_mode == "fulltext_txt":
+            return "llm+fulltext+metadata"
+        if source_mode == "abstract_metadata":
+            return "llm+abstract+metadata"
         return "llm+fulltext+metadata" if has_fulltext else "llm+abstract+metadata"
 
     def _parse_pdf_brief_summary(self, brief_text: str) -> dict[str, Any] | None:

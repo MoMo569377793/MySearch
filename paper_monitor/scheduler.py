@@ -32,6 +32,8 @@ def run_daemon(
     secondary_priority_only: bool = False,
     secondary_top_per_topic: int = 3,
     secondary_min_score: float = 24.0,
+    retry_from_variant: str | None = None,
+    retry_from_status: str = "incomplete",
 ) -> None:
     loops = 0
     runtime_variants = llm_variants or []
@@ -54,6 +56,8 @@ def run_daemon(
                 secondary_priority_only=secondary_priority_only,
                 secondary_top_per_topic=secondary_top_per_topic,
                 secondary_min_score=secondary_min_score,
+                retry_from_variant=retry_from_variant,
+                retry_from_status=retry_from_status,
             )
             if since_last_run and enrich_started_at is not None and not enrichment_stats.errors:
                 db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)

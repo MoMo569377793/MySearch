@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--secondary-on-priority", action="store_true", help="仅让额外模型处理高优先级论文；主模型仍处理全部论文")
     enrich_parser.add_argument("--secondary-top-per-topic", type=int, default=3, help="开启 --secondary-on-priority 后，每个领域送给额外模型二次总结的 Top N，默认 3")
     enrich_parser.add_argument("--secondary-min-score", type=float, default=24.0, help="开启 --secondary-on-priority 后，评分不低于该值的论文会送给额外模型，默认 24")
+    enrich_parser.add_argument("--retry-from-variant", help="只处理另一个模型仍缺失或回退的论文，例如 ikun 或 ikun_gpt-5.4")
+    enrich_parser.add_argument("--retry-from-status", choices=["incomplete", "fallback", "missing"], default="incomplete", help="和 --retry-from-variant 一起使用：incomplete=缺失或回退，fallback=仅回退，missing=仅缺失")
 
     report_parser = subparsers.add_parser("report", help="仅生成报告")
     report_parser.add_argument("--date", help="报告日期，格式 YYYY-MM-DD，默认今天")
@@ -137,6 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_parser.add_argument("--secondary-on-priority", action="store_true", help="仅让额外模型处理高优先级论文；主模型仍处理全部论文")
     run_once_parser.add_argument("--secondary-top-per-topic", type=int, default=3, help="开启 --secondary-on-priority 后，每个领域送给额外模型二次总结的 Top N，默认 3")
     run_once_parser.add_argument("--secondary-min-score", type=float, default=24.0, help="开启 --secondary-on-priority 后，评分不低于该值的论文会送给额外模型，默认 24")
+    run_once_parser.add_argument("--retry-from-variant", help="只让当前模型补跑另一个模型仍缺失或回退的论文，例如 ikun 或 ikun_gpt-5.4")
+    run_once_parser.add_argument("--retry-from-status", choices=["incomplete", "fallback", "missing"], default="incomplete", help="和 --retry-from-variant 一起使用：incomplete=缺失或回退，fallback=仅回退，missing=仅缺失")
 
     daemon_parser = subparsers.add_parser("daemon", help="持续轮询抓取，并覆盖更新当天报告")
     daemon_parser.add_argument("--type", default="daily", choices=["daily", "weekly"])
@@ -151,6 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--secondary-on-priority", action="store_true", help="仅让额外模型处理高优先级论文；主模型仍处理全部论文")
     daemon_parser.add_argument("--secondary-top-per-topic", type=int, default=3, help="开启 --secondary-on-priority 后，每个领域送给额外模型二次总结的 Top N，默认 3")
     daemon_parser.add_argument("--secondary-min-score", type=float, default=24.0, help="开启 --secondary-on-priority 后，评分不低于该值的论文会送给额外模型，默认 24")
+    daemon_parser.add_argument("--retry-from-variant", help="只让当前模型补跑另一个模型仍缺失或回退的论文，例如 ikun 或 ikun_gpt-5.4")
+    daemon_parser.add_argument("--retry-from-status", choices=["incomplete", "fallback", "missing"], default="incomplete", help="和 --retry-from-variant 一起使用：incomplete=缺失或回退，fallback=仅回退，missing=仅缺失")
 
     return parser
 
@@ -364,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
                 secondary_priority_only=args.secondary_on_priority,
                 secondary_top_per_topic=args.secondary_top_per_topic,
                 secondary_min_score=args.secondary_min_score,
+                retry_from_variant=args.retry_from_variant,
+                retry_from_status=args.retry_from_status,
             )
             if args.since_last_run and enrich_started_at is not None and not stats.errors:
                 db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)
@@ -465,6 +473,8 @@ def main(argv: list[str] | None = None) -> int:
                     secondary_priority_only=args.secondary_on_priority,
                     secondary_top_per_topic=args.secondary_top_per_topic,
                     secondary_min_score=args.secondary_min_score,
+                    retry_from_variant=args.retry_from_variant,
+                    retry_from_status=args.retry_from_status,
                 )
                 if args.since_last_run and enrich_started_at is not None and not enrichment_stats.errors:
                     db.set_checkpoint(ENRICH_CHECKPOINT_KEY, enrich_started_at)
@@ -520,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
                 secondary_priority_only=args.secondary_on_priority,
                 secondary_top_per_topic=args.secondary_top_per_topic,
                 secondary_min_score=args.secondary_min_score,
+                retry_from_variant=args.retry_from_variant,
+                retry_from_status=args.retry_from_status,
             )
             return 0
 
