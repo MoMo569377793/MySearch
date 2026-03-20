@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +16,10 @@ from paper_monitor.utils import normalize_whitespace, parse_source_datetime
 LOGGER = logging.getLogger(__name__)
 
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+ARXIV_ID_PATTERN = re.compile(
+    r"(?:(?:arxiv\.org/(?:abs|pdf)/)|(?:10\.48550/arxiv\.))?(\d{4}\.\d{4,5}(?:v\d+)?)",
+    re.I,
+)
 
 
 class ArxivFetcher:
@@ -43,6 +48,20 @@ class ArxivFetcher:
         candidates = self._apply_plan(candidates, plan)
         LOGGER.info("arXiv topic=%s fetched=%s", topic.id, len(candidates))
         return candidates
+
+    def fetch_single(self, identifier_or_url: str) -> PaperCandidate | None:
+        if not self.enabled:
+            return None
+        arxiv_id = extract_arxiv_id(identifier_or_url)
+        if not arxiv_id:
+            return None
+        params = urllib.parse.urlencode({"id_list": arxiv_id})
+        url = f"http://export.arxiv.org/api/query?{params}"
+        xml_text = self._request_feed(url)
+        items = self._parse_feed(xml_text, query=f"id:{arxiv_id}")
+        if not items:
+            return None
+        return items[0]
 
     def _fetch_query(self, query: str, plan: FetchPlan) -> list[PaperCandidate]:
         page_size = max(1, min(plan.page_size or self.config.max_results, 100))
@@ -194,3 +213,13 @@ def _year_from_datetime(value: str) -> int | None:
     if len(value) >= 4 and value[:4].isdigit():
         return int(value[:4])
     return None
+
+
+def extract_arxiv_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = ARXIV_ID_PATTERN.search(text)
+    if not match:
+        return ""
+    return match.group(1)

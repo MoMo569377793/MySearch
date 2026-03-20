@@ -8,6 +8,7 @@ import urllib.error
 from unittest import mock
 from pathlib import Path
 
+from paper_monitor.cli import main as cli_main
 from paper_monitor.config import load_settings
 from paper_monitor.enrichment import (
     DocumentArtifacts,
@@ -15,12 +16,19 @@ from paper_monitor.enrichment import (
     EnrichmentPipeline,
     _summary_has_complete_pdf_output,
 )
+from paper_monitor.fetchers.arxiv import extract_arxiv_id
 from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import FetchPlan, LLMResult
-from paper_monitor.models import PaperCandidate, PaperRecord, ReportEntry, RunStats, TopicEvaluation
+from paper_monitor.models import PaperCandidate, PaperLLMSummary, PaperRecord, ReportEntry, RunStats, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
-from paper_monitor.reports import generate_catalog_report, generate_comparison_report, generate_paper_reports, generate_report
+from paper_monitor.reports import (
+    generate_catalog_report,
+    generate_comparison_report,
+    generate_paper_reports,
+    generate_preview_report,
+    generate_report,
+)
 from paper_monitor.scoring import evaluate_candidate_against_topic, evaluate_paper_against_topic
 from paper_monitor.storage import Database
 
@@ -31,6 +39,100 @@ FIXTURE_CONFIG_POE = REPO_ROOT / "config" / "config-poe.json"
 
 
 class MonitorPipelineTest(unittest.TestCase):
+    def test_extract_arxiv_id_supports_abs_and_pdf_urls(self) -> None:
+        self.assertEqual(extract_arxiv_id("https://arxiv.org/abs/2501.12345v2"), "2501.12345v2")
+        self.assertEqual(extract_arxiv_id("https://arxiv.org/pdf/2501.12345v2.pdf"), "2501.12345v2")
+        self.assertEqual(extract_arxiv_id("10.48550/arXiv.2501.12345"), "2501.12345")
+
+    def test_paper_preview_exports_files_without_touching_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(
+                FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            exit_code = cli_main(
+                [
+                    "--config",
+                    str(root / "config" / "config.json"),
+                    "paper-preview",
+                    "--title",
+                    "Preview Only Matrix-Free GPU Operator Evaluation",
+                    "--abstract",
+                    "This paper studies matrix-free operator evaluation, GPU implementation, and performance portability.",
+                    "--primary-url",
+                    "https://example.com/preview-paper",
+                    "--skip-pdf",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(list((root / "reports" / "preview").glob("*.md"))), 1)
+            self.assertEqual(len(list((root / "exports" / "preview").glob("*.json"))), 1)
+            self.assertFalse((root / "data" / "papers.db").exists())
+
+    def test_paper_preview_can_autofill_metadata_from_arxiv_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(
+                FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            feed = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2501.12345v2</id>
+    <updated>2026-03-20T08:00:00Z</updated>
+    <published>2026-03-19T08:00:00Z</published>
+    <title>Autofilled Matrix-Free Preview Paper</title>
+    <summary>We study matrix-free operator evaluation with GPU performance portability.</summary>
+    <author><name>Alice</name></author>
+    <author><name>Bob</name></author>
+    <link rel="alternate" href="https://arxiv.org/abs/2501.12345v2" />
+    <link title="pdf" href="https://arxiv.org/pdf/2501.12345v2.pdf" />
+    <arxiv:doi>10.1000/autofill-preview</arxiv:doi>
+    <category term="cs.NA" />
+  </entry>
+</feed>
+"""
+
+            class FakeResponse:
+                def __init__(self, payload: str) -> None:
+                    self.payload = payload.encode("utf-8")
+                    self.headers = {"Content-Type": "application/atom+xml"}
+
+                def read(self) -> bytes:
+                    return self.payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    return None
+
+            with mock.patch("paper_monitor.fetchers.arxiv.urllib.request.urlopen", return_value=FakeResponse(feed)):
+                exit_code = cli_main(
+                    [
+                        "--config",
+                        str(root / "config" / "config.json"),
+                        "paper-preview",
+                        "--primary-url",
+                        "https://arxiv.org/abs/2501.12345v2",
+                        "--skip-pdf",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            preview_json = next((root / "exports" / "preview").glob("*.json"))
+            payload = json.loads(preview_json.read_text(encoding="utf-8"))
+            self.assertEqual(payload["paper"]["title"], "Autofilled Matrix-Free Preview Paper")
+            self.assertEqual(payload["paper"]["doi"], "10.1000/autofill-preview")
+            self.assertEqual(payload["paper"]["arxiv_id"], "2501.12345v2")
+
     def test_complete_pdf_output_requires_pdf_basis(self) -> None:
         summary = type(
             "Summary",
@@ -3131,6 +3233,95 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("\"summary_scope\": \"已直接读取 PDF\"", export)
 
             db.close()
+
+    def test_generate_preview_report_exports_single_paper_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            paper = PaperRecord(
+                id=123456,
+                title="Preview Export Sample",
+                title_norm="preview export sample",
+                abstract="matrix-free operator evaluation on GPUs",
+                authors=["Alice"],
+                published_at="2026-03-20",
+                updated_at="2026-03-20",
+                primary_url="https://example.com/preview",
+                pdf_url="https://example.com/preview.pdf",
+                doi="",
+                arxiv_id="",
+                venue="PreviewConf",
+                year=2026,
+                categories=["cs.DC"],
+                summary_text="默认总结",
+                summary_basis="fulltext+metadata",
+                tags=["preview"],
+                pdf_local_path="artifacts/pdfs/preview.pdf",
+                pdf_status="downloaded",
+                pdf_downloaded_at="2026-03-20T10:00:00+08:00",
+                fulltext_txt_path="artifacts/text/preview.txt",
+                fulltext_excerpt="fulltext excerpt",
+                fulltext_status="extracted",
+                page_count=12,
+                llm_summary={},
+                analysis_updated_at="2026-03-20T10:00:00+08:00",
+                source_first="preview",
+                created_at="2026-03-20T10:00:00+08:00",
+                last_seen_at="2026-03-20T10:00:00+08:00",
+                metadata={"preview": True},
+            )
+            evaluations = [
+                TopicEvaluation(
+                    topic_id="matrix_free_fem",
+                    topic_name="有限元分析 Matrix-Free 算法优化",
+                    score=42.0,
+                    classification="relevant",
+                    matched_keywords=["matrix-free", "gpu"],
+                    reasons=["命中硬性关键词组"],
+                )
+            ]
+            summaries = [
+                PaperLLMSummary(
+                    paper_id=paper.id,
+                    variant_id="ikun",
+                    variant_label="ikun_gpt-5.4",
+                    provider="IkunCoding",
+                    base_url="https://example.com/v1",
+                    model="gpt-5.4",
+                    summary_text="问题：A 方法：B 结果：C",
+                    summary_basis="llm+pdf+metadata",
+                    tags=["gpu"],
+                    structured={"source_mode": "pdf_direct", "direct_pdf_status": "used"},
+                    usage={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                    created_at="2026-03-20T10:00:00+08:00",
+                    updated_at="2026-03-20T10:00:00+08:00",
+                )
+            ]
+
+            outputs = generate_preview_report(
+                settings,
+                paper,
+                evaluations,
+                source_names=["preview"],
+                source_urls=["https://example.com/preview"],
+                summaries=summaries,
+                llm_variants=None,
+                paper_add_suggestion={"recommended_topic_ids": ["matrix_free_fem"]},
+            )
+            markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")
+            export = Path(outputs["json"]).read_text(encoding="utf-8")
+
+            self.assertEqual(set(outputs.keys()), {"markdown", "html", "json"})
+            self.assertTrue(Path(outputs["markdown"]).exists())
+            self.assertTrue(Path(outputs["html"]).exists())
+            self.assertTrue(Path(outputs["json"]).exists())
+            self.assertIn("单篇论文预分析 - Preview Export Sample", markdown)
+            self.assertIn("未入库（预分析）", markdown)
+            self.assertIn("\"persisted\": false", export)
 
     def test_generate_catalog_report_lists_stored_model_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

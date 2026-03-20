@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 data/*.db
 reports/*
-exports/*.json
-exports/papers/*.json
+exports/*
 artifacts/pdfs/*
 artifacts/text/*
 *.env

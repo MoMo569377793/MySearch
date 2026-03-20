@@ -12,7 +12,7 @@ from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import PaperLLMSummary, PaperRecord, ReportEntry, Settings, TopicEvaluation
 from paper_monitor.progress import ProgressBar
 from paper_monitor.storage import Database
-from paper_monitor.utils import ensure_directory, now_iso, shorten, to_day_bounds
+from paper_monitor.utils import ensure_directory, now_iso, shorten, stable_hash, to_day_bounds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -551,6 +551,18 @@ def _paper_report_stem(paper: PaperRecord) -> str:
     return f"{paper.id:06d}-{slug}"
 
 
+def _preview_report_stem(paper: PaperRecord, settings: Settings) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in paper.title)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    slug = slug.strip("-")[:72] or "paper-preview"
+    timestamp = now_iso(settings.timezone).replace(":", "").replace("-", "").replace("+", "_").replace("T", "-")
+    fingerprint = stable_hash(
+        paper.doi or paper.arxiv_id or paper.pdf_url or paper.primary_url or paper.title
+    )[:10]
+    return f"preview-{timestamp}-{fingerprint}-{slug}"
+
+
 def _variants_for_paper(
     summaries: list[PaperLLMSummary],
     variants: list[LLMRuntimeVariant] | None,
@@ -655,11 +667,19 @@ def _render_paper_markdown(
     source_urls: list[str],
     summaries: list[PaperLLMSummary],
     variants: list[LLMRuntimeVariant | dict],
+    *,
+    persisted: bool = True,
 ) -> str:
     lines = [
-        f"# 单篇论文总结 - {paper.title}",
+        f"# {'单篇论文总结' if persisted else '单篇论文预分析'} - {paper.title}",
         "",
-        f"- paper_id：`{paper.id}`",
+    ]
+    if persisted:
+        lines.append(f"- paper_id：`{paper.id}`")
+    else:
+        lines.append("- 数据库状态：`未入库（预分析）`")
+    lines.extend(
+        [
         f"- 发布时间：`{paper.published_at or '未知'}`",
         f"- Venue / 分类：`{paper.venue or '未知'}` / `{', '.join(paper.categories) or '无'}`",
         f"- 作者：`{', '.join(paper.authors[:12]) or '未知'}`",
@@ -667,7 +687,8 @@ def _render_paper_markdown(
         f"- 原始链接：{paper.primary_url or (source_urls[0] if source_urls else '无')}",
         f"- PDF 状态：`{paper.pdf_status}` / 全文状态：`{paper.fulltext_status}` / 页数：`{paper.page_count or '未知'}`",
         f"- 默认总结来源：`{paper.summary_basis or '未知'}`",
-    ]
+        ]
+    )
     if paper.pdf_local_path:
         lines.append(f"- 本地 PDF：`{paper.pdf_local_path}`")
     if paper.fulltext_txt_path:
@@ -698,13 +719,15 @@ def _render_paper_html(
     source_urls: list[str],
     summaries: list[PaperLLMSummary],
     variants: list[LLMRuntimeVariant | dict],
+    *,
+    persisted: bool = True,
 ) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>单篇论文总结 - {html.escape(paper.title)}</title>
+  <title>{'单篇论文总结' if persisted else '单篇论文预分析'} - {html.escape(paper.title)}</title>
   <style>
     :root {{
       --bg: #f3efe7;
@@ -769,7 +792,7 @@ def _render_paper_html(
   <main>
     <article>
       <h1>{html.escape(paper.title)}</h1>
-      <p class="meta">paper_id {paper.id} / 发布时间 {html.escape(paper.published_at or '未知')} / Venue {html.escape(paper.venue or '未知')}</p>
+      <p class="meta">{f'paper_id {paper.id}' if persisted else '未入库（预分析）'} / 发布时间 {html.escape(paper.published_at or '未知')} / Venue {html.escape(paper.venue or '未知')}</p>
       <p class="meta">来源 {html.escape(', '.join(source_names) or paper.source_first or '未知')} / PDF {html.escape(paper.pdf_status)} / 全文 {html.escape(paper.fulltext_status)} / 页数 {html.escape(str(paper.page_count or '未知'))}</p>
       <p class="meta">作者 {html.escape(', '.join(paper.authors[:12]) or '未知')}</p>
       <p><a href="{html.escape(paper.primary_url or (source_urls[0] if source_urls else '#'))}">打开原始链接</a></p>
@@ -825,8 +848,24 @@ def generate_paper_reports(
         stem = _paper_report_stem(paper)
         if progress_bar:
             progress_bar.set_detail(f"单篇导出 {shorten(paper.title, 52)}")
-        markdown_text = _render_paper_markdown(paper, evaluations, source_names, source_urls, summaries, variants)
-        html_text = _render_paper_html(paper, evaluations, source_names, source_urls, summaries, variants)
+        markdown_text = _render_paper_markdown(
+            paper,
+            evaluations,
+            source_names,
+            source_urls,
+            summaries,
+            variants,
+            persisted=True,
+        )
+        html_text = _render_paper_html(
+            paper,
+            evaluations,
+            source_names,
+            source_urls,
+            summaries,
+            variants,
+            persisted=True,
+        )
         json_text = json.dumps(
             {
                 "paper_id": paper.id,
@@ -911,6 +950,131 @@ def generate_paper_reports(
         if progress_bar:
             progress_bar.advance(detail=f"单篇完成 {shorten(paper.title, 52)}")
     return outputs
+
+
+def generate_preview_report(
+    settings: Settings,
+    paper: PaperRecord,
+    evaluations: list[TopicEvaluation],
+    *,
+    source_names: list[str],
+    source_urls: list[str],
+    summaries: list[PaperLLMSummary],
+    llm_variants: list[LLMRuntimeVariant] | None = None,
+    paper_add_suggestion: dict | None = None,
+) -> dict[str, str]:
+    report_root = settings.report_dir / "preview"
+    export_root = settings.export_dir / "preview"
+    ensure_directory(report_root)
+    ensure_directory(export_root)
+
+    variants = _variants_for_paper(summaries, llm_variants)
+    if llm_variants:
+        allowed_variant_ids = _allowed_variant_ids(list(llm_variants))
+        summaries = [summary for summary in summaries if summary.variant_id in allowed_variant_ids]
+        display_variants: list[LLMRuntimeVariant | dict] = list(llm_variants)
+    else:
+        display_variants = _merge_variants_with_stored_summaries(variants, {paper.id: summaries})
+
+    stem = _preview_report_stem(paper, settings)
+    markdown_text = _render_paper_markdown(
+        paper,
+        evaluations,
+        source_names,
+        source_urls,
+        summaries,
+        display_variants,
+        persisted=False,
+    )
+    html_text = _render_paper_html(
+        paper,
+        evaluations,
+        source_names,
+        source_urls,
+        summaries,
+        display_variants,
+        persisted=False,
+    )
+    json_text = json.dumps(
+        {
+            "mode": "preview",
+            "persisted": False,
+            "paper": {
+                "preview_id": paper.id,
+                "title": paper.title,
+                "published_at": paper.published_at,
+                "authors": paper.authors,
+                "venue": paper.venue,
+                "categories": paper.categories,
+                "primary_url": paper.primary_url,
+                "pdf_url": paper.pdf_url,
+                "doi": paper.doi,
+                "arxiv_id": paper.arxiv_id,
+                "pdf_status": paper.pdf_status,
+                "pdf_local_path": paper.pdf_local_path,
+                "fulltext_status": paper.fulltext_status,
+                "fulltext_txt_path": paper.fulltext_txt_path,
+                "summary_text": paper.summary_text,
+                "summary_basis": paper.summary_basis,
+            },
+            "topics": [
+                {
+                    "topic_id": item.topic_id,
+                    "topic_name": item.topic_name,
+                    "score": item.score,
+                    "classification": item.classification,
+                    "matched_keywords": item.matched_keywords,
+                    "reasons": item.reasons,
+                }
+                for item in evaluations
+            ],
+            "sources": {
+                "names": source_names,
+                "urls": source_urls,
+            },
+            "llm_summaries": [
+                {
+                    "variant_id": summary.variant_id,
+                    "variant_label": summary.variant_label,
+                    "provider": summary.provider,
+                    "base_url": summary.base_url,
+                    "model": summary.model,
+                    "summary_text": summary.summary_text,
+                    "summary_basis": summary.summary_basis,
+                    "summary_scope": _summary_scope_label(summary),
+                    "summary_scope_note": _summary_scope_note(summary),
+                    "source_mode": (
+                        summary.structured.get("source_mode", "")
+                        if isinstance(summary.structured, dict)
+                        else ""
+                    ),
+                    "pdf_input_strategy": (
+                        summary.structured.get("pdf_input_strategy", "")
+                        if isinstance(summary.structured, dict)
+                        else ""
+                    ),
+                    "structured": summary.structured,
+                    "usage": summary.usage,
+                }
+                for summary in summaries
+            ],
+            "paper_add_suggestion": paper_add_suggestion or {},
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    markdown_path = report_root / f"{stem}.md"
+    html_path = report_root / f"{stem}.html"
+    json_path = export_root / f"{stem}.json"
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+    html_path.write_text(html_text, encoding="utf-8")
+    json_path.write_text(json_text + "\n", encoding="utf-8")
+    return {
+        "markdown": str(markdown_path),
+        "html": str(html_path),
+        "json": str(json_path),
+    }
 
 
 def _serialize_variants(variants: list[LLMRuntimeVariant | dict]) -> list[dict[str, str]]:
