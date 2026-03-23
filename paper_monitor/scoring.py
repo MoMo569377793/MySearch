@@ -14,7 +14,6 @@ def _combined_text(title: str, abstract: str, venue: str, categories: list[str],
         abstract,
         venue,
         " ".join(categories),
-        " ".join(tags),
     ]
     return normalize_title(" ".join(part for part in parts if part))
 
@@ -26,6 +25,55 @@ def _category_hits(categories: list[str], categories_text: str) -> list[str]:
         if needle and needle in categories_text:
             hits.append(category)
     return hits
+
+
+def _keyword_group_matches(group: list[str], text: str) -> list[str]:
+    return [keyword for keyword in group if keyword_in_text(keyword, text)]
+
+
+def _evaluate_required_keyword_lanes(
+    lanes: list[list[list[str]]],
+    text: str,
+) -> tuple[bool, float, list[str], list[str]]:
+    best_complete: tuple[float, list[str], list[str]] | None = None
+    best_partial: tuple[int, int, list[str]] | None = None
+
+    for lane_index, lane in enumerate(lanes, start=1):
+        lane_keywords: list[str] = []
+        lane_group_summaries: list[str] = []
+        lane_score = 0.0
+        matched_group_count = 0
+
+        for group in lane:
+            matches = _keyword_group_matches(group, text)
+            if matches:
+                matched_group_count += 1
+                lane_score += 10.0 + max(len(matches) - 1, 0)
+                lane_keywords.extend(matches)
+                lane_group_summaries.append(" / ".join(matches[:3]))
+
+        if matched_group_count == len(lane):
+            lane_score += 2.0
+            lane_reasons = [f"命中硬性准入路径 {lane_index}: {' ; '.join(lane_group_summaries[:3])}"]
+            candidate = (lane_score, unique_strings(lane_keywords), lane_reasons)
+            if best_complete is None or candidate[0] > best_complete[0] or (
+                candidate[0] == best_complete[0] and len(candidate[1]) > len(best_complete[1])
+            ):
+                best_complete = candidate
+        elif matched_group_count > 0:
+            partial = (
+                matched_group_count,
+                len(lane),
+                [f"最接近的硬性准入路径 {lane_index}: 已命中 {matched_group_count}/{len(lane)} 组"],
+            )
+            if best_partial is None or partial[:2] > best_partial[:2]:
+                best_partial = partial
+
+    if best_complete is not None:
+        return True, best_complete[0], best_complete[1], best_complete[2]
+    if best_partial is not None:
+        return False, 0.0, [], best_partial[2]
+    return False, 0.0, [], ["未命中任何硬性准入路径"]
 
 
 def _coerce_metric(value: Any) -> int:
@@ -136,17 +184,30 @@ def _evaluate_topic(
     missing_required_groups = 0
     missing_soft_groups = 0
 
-    for group in topic.required_keyword_groups:
-        matches = [keyword for keyword in group if keyword_in_text(keyword, text)]
-        if matches:
-            score += 10.0 + max(len(matches) - 1, 0)
-            matched_keywords.extend(matches)
-            reasons.append(f"命中硬性关键词组: {', '.join(matches[:3])}")
+    if topic.required_keyword_lanes:
+        lane_satisfied, lane_score, lane_keywords, lane_reasons = _evaluate_required_keyword_lanes(
+            topic.required_keyword_lanes,
+            text,
+        )
+        if lane_satisfied:
+            score += lane_score
+            matched_keywords.extend(lane_keywords)
+            reasons.extend(lane_reasons)
         else:
-            missing_required_groups += 1
+            missing_required_groups = 1
+            reasons.extend(lane_reasons)
+    else:
+        for group in topic.required_keyword_groups:
+            matches = _keyword_group_matches(group, text)
+            if matches:
+                score += 10.0 + max(len(matches) - 1, 0)
+                matched_keywords.extend(matches)
+                reasons.append(f"命中硬性关键词组: {', '.join(matches[:3])}")
+            else:
+                missing_required_groups += 1
 
     for group in topic.must_match_groups:
-        matches = [keyword for keyword in group if keyword_in_text(keyword, text)]
+        matches = _keyword_group_matches(group, text)
         if matches:
             score += 6.0 + max(len(matches) - 1, 0)
             matched_keywords.extend(matches)
@@ -215,9 +276,15 @@ def _evaluate_topic(
 
     matched_keywords = unique_strings(matched_keywords)
 
-    if missing_required_groups > 0:
+    if topic.id == "ai_operator_acceleration" and exclude_hits:
         classification = "irrelevant"
-        reasons.append("缺少硬性关键词组，判定为不相关")
+        reasons.append("命中 AI 主题的算法/模型排除词，判定为不相关")
+    elif missing_required_groups > 0:
+        classification = "irrelevant"
+        if topic.required_keyword_lanes:
+            reasons.append("缺少任一硬性准入路径，判定为不相关")
+        else:
+            reasons.append("缺少硬性关键词组，判定为不相关")
     elif exclude_hits and score < topic.threshold * 0.85:
         classification = "irrelevant"
     elif score >= topic.threshold:

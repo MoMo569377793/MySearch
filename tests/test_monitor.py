@@ -20,9 +20,10 @@ from paper_monitor.fetchers.arxiv import extract_arxiv_id
 from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
 from paper_monitor.models import FetchPlan, LLMResult
-from paper_monitor.models import PaperCandidate, PaperLLMSummary, PaperRecord, ReportEntry, RunStats, TopicEvaluation
+from paper_monitor.models import PaperCandidate, PaperLLMSummary, PaperRecord, ReportEntry, RunStats, TopicConfig, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.reports import (
+    _prepare_digest_entries_for_variant,
     generate_catalog_report,
     generate_comparison_report,
     generate_paper_reports,
@@ -362,6 +363,188 @@ class MonitorPipelineTest(unittest.TestCase):
         self.assertIn(evaluation.classification, {"relevant", "maybe"})
         self.assertGreaterEqual(evaluation.score, topic.threshold)
 
+    def test_matrix_free_topic_rejects_cross_domain_matrix_free_contract_paper(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "matrix_free_fem")
+
+        candidate = PaperCandidate(
+            source_name="arxiv",
+            source_paper_id="econ-1",
+            query_text="fixture",
+            title="Scalable Principal-Agent Contract Design via Gradient-Based Optimization",
+            abstract=(
+                "We introduce a matrix-free, variance-reduced bilevel optimization framework for contract design "
+                "using implicit differentiation with conjugate gradients and benchmark CARA-Normal environments."
+            ),
+            authors=["Alice"],
+            venue="arXiv",
+            year=2025,
+            categories=["econ.TH"],
+            raw={},
+        )
+
+        self.assertEqual(evaluate_candidate_against_topic(candidate, topic).classification, "irrelevant")
+
+    def test_matrix_free_topic_ignores_llm_tags_when_scoring_existing_papers(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "matrix_free_fem")
+
+        paper = PaperRecord(
+            id=98,
+            title="OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer",
+            title_norm="ovgggt",
+            abstract=(
+                "We present a training-free framework for streaming visual geometry transformers that bounds GPU "
+                "memory with a fixed budget while remaining compatible with FlashAttention."
+            ),
+            authors=["Alice"],
+            published_at="2026-02-01T00:00:00+08:00",
+            updated_at="2026-02-01T00:00:00+08:00",
+            primary_url="https://example.com/ovggt",
+            pdf_url="https://example.com/ovggt.pdf",
+            doi="",
+            arxiv_id="2603.05959",
+            venue="arXiv",
+            year=2026,
+            categories=["cs.CV"],
+            summary_text="",
+            summary_basis="",
+            tags=["与Matrix-Free/DG弱相关", "GPU推理优化", "训练免费方法"],
+            pdf_local_path="",
+            pdf_status="pending",
+            pdf_downloaded_at=None,
+            fulltext_txt_path="",
+            fulltext_excerpt="",
+            fulltext_status="empty",
+            page_count=None,
+            llm_summary={},
+            analysis_updated_at=None,
+            source_first="arxiv",
+            created_at="2026-03-20T00:00:00+08:00",
+            last_seen_at="2026-03-20T00:00:00+08:00",
+            metadata={},
+        )
+
+        self.assertEqual(evaluate_paper_against_topic(paper, topic).classification, "irrelevant")
+
+    def test_ai_topic_accepts_distributed_runtime_lane(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+        candidate = PaperCandidate(
+            source_name="arxiv",
+            source_paper_id="ai-runtime-1",
+            query_text="fixture",
+            title="AutoOverlap: Enabling Fine-Grained Overlap of Computation and Communication with Chunk-Based Scheduling",
+            abstract=(
+                "Communication has become a first-order bottleneck in large-scale GPU workloads. "
+                "We present AutoOverlap, a compiler and runtime that enables automatic fine-grained "
+                "overlap inside a single fused kernel. Implemented as a source-to-source compiler on "
+                "Triton, AutoOverlap aligns computation with chunk availability and delivers up to "
+                "4.7x speedup on multi-GPU workloads."
+            ),
+            authors=["Alice"],
+            venue="MLSys",
+            year=2026,
+            categories=["cs.DC", "cs.LG"],
+            raw={},
+        )
+
+        evaluation = evaluate_candidate_against_topic(candidate, topic)
+        self.assertEqual(evaluation.classification, "relevant")
+        self.assertTrue(any("硬性准入路径" in reason for reason in evaluation.reasons))
+
+    def test_ai_topic_accepts_cpu_vector_lane(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+        candidate = PaperCandidate(
+            source_name="dblp",
+            source_paper_id="ai-cpu-1",
+            query_text="fixture",
+            title="ARM SME Microkernels for Transformer GEMM Inference",
+            abstract=(
+                "We implement SIMD microkernels using ARM SME and SVE for GEMM and attention in transformer "
+                "inference, and report throughput and latency benchmarks."
+            ),
+            authors=["Alice"],
+            venue="CGO",
+            year=2025,
+            categories=["cs.AR"],
+            raw={},
+        )
+
+        self.assertEqual(evaluate_candidate_against_topic(candidate, topic).classification, "relevant")
+
+    def test_ai_topic_rejects_token_pruning_paper(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+        candidate = PaperCandidate(
+            source_name="arxiv",
+            source_paper_id="ai-model-1",
+            query_text="fixture",
+            title="IDPruner: Harmonizing Importance and Diversity in Visual Token Pruning for MLLMs",
+            abstract=(
+                "We propose a visual token pruning method for multimodal large language models that reduces "
+                "inference cost without introducing a new kernel implementation or runtime system."
+            ),
+            authors=["Alice"],
+            venue="arXiv",
+            year=2026,
+            categories=["cs.CV", "cs.LG"],
+            raw={},
+        )
+
+        self.assertEqual(evaluate_candidate_against_topic(candidate, topic).classification, "irrelevant")
+
+    def test_ai_topic_rejects_tensorgalerkin_pde_system_paper(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+        candidate = PaperCandidate(
+            source_name="arxiv",
+            source_paper_id="ai-pde-1",
+            query_text="fixture",
+            title="Learning, Solving and Optimizing PDEs with TensorGalerkin",
+            abstract=(
+                "We present a high-performance GPU-compliant TensorGalerkin framework for linear system assembly "
+                "in PDE solvers and physics-informed operator learning. The method tensorizes element-wise "
+                "operations and uses sparse matrix multiplication for mesh-induced reductions."
+            ),
+            authors=["Alice"],
+            venue="arXiv",
+            year=2026,
+            categories=["cs.LG"],
+            raw={},
+        )
+
+        self.assertEqual(evaluate_candidate_against_topic(candidate, topic).classification, "irrelevant")
+
+    def test_ai_topic_rejects_training_free_visual_geometry_flashattention_paper(self) -> None:
+        settings = load_settings(FIXTURE_CONFIG_IKUN)
+        topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+        candidate = PaperCandidate(
+            source_name="arxiv",
+            source_paper_id="ai-vision-1",
+            query_text="fixture",
+            title="OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer",
+            abstract=(
+                "Recent geometric foundation models achieve impressive reconstruction quality through "
+                "all-to-all attention, yet their quadratic cost confines them to short offline sequences. "
+                "We present a training-free framework that compresses the KV cache while remaining compatible "
+                "with FlashAttention for long-horizon visual geometry inference."
+            ),
+            authors=["Alice"],
+            venue="arXiv",
+            year=2026,
+            categories=["cs.CV"],
+            raw={},
+        )
+
+        self.assertEqual(evaluate_candidate_against_topic(candidate, topic).classification, "irrelevant")
+
     def test_recent_limit_preserves_cited_classics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -523,13 +706,16 @@ class MonitorPipelineTest(unittest.TestCase):
                 lookback_days=1,
                 llm_client=FakeRenderClient(),
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            html = Path(paths["html"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            matrix_markdown = (topic_dir / "daily-2026-03-10--matrix_free_fem.md").read_text(encoding="utf-8")
+            ai_markdown = (topic_dir / "daily-2026-03-10--ai_operator_acceleration.md").read_text(encoding="utf-8")
+            matrix_html = (topic_dir / "daily-2026-03-10--matrix_free_fem.html").read_text(encoding="utf-8")
+            ai_html = (topic_dir / "daily-2026-03-10--ai_operator_acceleration.html").read_text(encoding="utf-8")
 
-            self.assertIn("Matrix-Free Finite Element Operator Evaluation on GPUs", markdown)
-            self.assertIn("Kernel Fusion for Transformer Inference with FlashAttention and Triton", markdown)
-            self.assertIn("有限元分析 Matrix-Free 算法优化", html)
-            self.assertIn("AI 算子加速", html)
+            self.assertIn("Matrix-Free Finite Element Operator Evaluation on GPUs", matrix_markdown)
+            self.assertIn("Kernel Fusion for Transformer Inference with FlashAttention and Triton", ai_markdown)
+            self.assertIn("有限元分析 Matrix-Free 算法优化", matrix_html)
+            self.assertIn("AI 算子加速", ai_html)
 
             db.close()
 
@@ -599,7 +785,8 @@ class MonitorPipelineTest(unittest.TestCase):
                 use_llm_topic_digest=False,
             )
 
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--matrix_free_fem.md").read_text(encoding="utf-8")
             self.assertIn("ikun_gpt-5.4 主题概览：未生成", markdown)
             self.assertIn("Stored Variant Render Sample", markdown)
             db.close()
@@ -647,8 +834,9 @@ class MonitorPipelineTest(unittest.TestCase):
                 lookback_days=1,
                 llm_client=FakeRenderClient(),
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            report_json = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--matrix_free_fem.md").read_text(encoding="utf-8")
+            report_json = json.loads((root / "exports" / "daily-2026-03-10--matrix_free_fem.json").read_text(encoding="utf-8"))
 
             self.assertIn("本窗口内没有新的严格命中论文。", markdown)
             self.assertIn("自动补充：近 `90` 天高分回顾", markdown)
@@ -817,7 +1005,8 @@ class MonitorPipelineTest(unittest.TestCase):
                 lookback_days=1,
                 llm_client=FakeRenderClient(),
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--matrix_free_fem.md").read_text(encoding="utf-8")
             self.assertIn("全文状态", markdown)
             self.assertIn("llm+fulltext+metadata", markdown)
 
@@ -2959,8 +3148,9 @@ class MonitorPipelineTest(unittest.TestCase):
                 llm_client=fake_client,
                 use_llm_topic_digest=True,
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            export = Path(paths["json"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--ai_operator_acceleration.md").read_text(encoding="utf-8")
+            export = (root / "exports" / "daily-2026-03-10--ai_operator_acceleration.json").read_text(encoding="utf-8")
             self.assertEqual(fake_client.seen_summary_text, "这是 gpt-5.4 自己的逐篇总结。")
             self.assertIn("gpt-5.4 主题概览", markdown)
             self.assertIn("attention kernel 与 kernel fusion", markdown)
@@ -3055,8 +3245,9 @@ class MonitorPipelineTest(unittest.TestCase):
                 topic_digest_variants=[primary_variant],
                 use_llm_topic_digest=True,
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            export = Path(paths["json"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--ai_operator_acceleration.md").read_text(encoding="utf-8")
+            export = (root / "exports" / "daily-2026-03-10--ai_operator_acceleration.json").read_text(encoding="utf-8")
 
             self.assertIn("LLM 模型数：`2`", markdown)
             self.assertIn("primary digest", markdown)
@@ -3065,6 +3256,268 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertNotIn("\"ikun\": {", export)
 
             db.close()
+
+    def test_generate_report_writes_split_topic_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2603.00011",
+                    query_text="matrix-free finite element",
+                    title="Matrix-Free DG Operator Evaluation on GPUs",
+                    abstract="matrix-free operator evaluation with sum factorization on GPUs and performance portability",
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2603.00011",
+                    pdf_url="https://arxiv.org/pdf/2603.00011.pdf",
+                    doi="",
+                    arxiv_id="2603.00011",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.NA"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2603.00012",
+                    query_text="flashattention triton compiler kernel fusion",
+                    title="Kernel Fusion for Transformer Inference with Triton",
+                    abstract="We optimize transformer inference with Triton kernel fusion and GPU runtime scheduling.",
+                    authors=["Bob"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2603.00012",
+                    pdf_url="https://arxiv.org/pdf/2603.00012.pdf",
+                    doi="",
+                    arxiv_id="2603.00012",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.LG"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+
+            paths = generate_report(
+                db,
+                settings,
+                report_date="2026-03-10",
+                report_type="daily",
+                lookback_days=1,
+            )
+
+            topic_dir = Path(paths["topic_dir"])
+            self.assertTrue(topic_dir.exists())
+            matrix_md = topic_dir / "daily-2026-03-10--matrix_free_fem.md"
+            ai_md = topic_dir / "daily-2026-03-10--ai_operator_acceleration.md"
+            matrix_json = root / "exports" / "daily-2026-03-10--matrix_free_fem.json"
+            ai_json = root / "exports" / "daily-2026-03-10--ai_operator_acceleration.json"
+            self.assertTrue(matrix_md.exists())
+            self.assertTrue(ai_md.exists())
+            self.assertTrue(matrix_json.exists())
+            self.assertTrue(ai_json.exists())
+            matrix_text = matrix_md.read_text(encoding="utf-8")
+            ai_text = ai_md.read_text(encoding="utf-8")
+            self.assertIn("## 有限元分析 Matrix-Free 算法优化", matrix_text)
+            self.assertNotIn("## AI 算子加速", matrix_text)
+            self.assertIn("## AI 算子加速", ai_text)
+            self.assertNotIn("## 有限元分析 Matrix-Free 算法优化", ai_text)
+
+            db.close()
+
+    def test_matrix_free_digest_selection_uses_bucketed_diversity(self) -> None:
+        topic = TopicConfig(
+            id="matrix_free_fem",
+            display_name="有限元分析 Matrix-Free 算法优化",
+            description="desc",
+            source_queries={},
+        )
+
+        def make_entry(idx: int, title: str, abstract: str, score: float) -> ReportEntry:
+            return ReportEntry(
+                topic_id=topic.id,
+                topic_name=topic.display_name,
+                score=score,
+                classification="relevant",
+                matched_keywords=["matrix-free"],
+                reasons=["fixture"],
+                source_names=["seed"],
+                source_urls=[],
+                paper=PaperRecord(
+                    id=idx,
+                    title=title,
+                    title_norm=title.lower(),
+                    abstract=abstract,
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://example.com",
+                    pdf_url="https://example.com/paper.pdf",
+                    doi="",
+                    arxiv_id="",
+                    venue="arXiv",
+                    year=2026,
+                    categories=[],
+                    summary_text=abstract,
+                    summary_basis="llm+abstract+metadata",
+                    tags=[],
+                    pdf_local_path="",
+                    pdf_status="pending",
+                    pdf_downloaded_at=None,
+                    fulltext_txt_path="",
+                    fulltext_excerpt="",
+                    fulltext_status="empty",
+                    page_count=None,
+                    llm_summary={},
+                    analysis_updated_at=None,
+                    source_first="seed",
+                    created_at="2026-03-10T09:00:00+08:00",
+                    last_seen_at="2026-03-10T09:00:00+08:00",
+                    metadata={},
+                ),
+            )
+
+        entries = [
+            make_entry(i + 1, f"deal.II matrix-free framework paper {i}", "matrix-free finite element framework implementation on CPU", 1000 - i)
+            for i in range(12)
+        ]
+        entries.extend(
+            [
+                make_entry(20, "Matrix-free DG operator evaluation with sum factorization", "matrix-free operator evaluation and sum factorization kernels", 880),
+                make_entry(21, "GPU portability for matrix-free finite element operators", "matrix-free gpu portability on cuda hip sycl", 870),
+                make_entry(22, "Multigrid for matrix-free high-order finite elements", "matrix-free multigrid preconditioner on GPU", 860),
+                make_entry(23, "Matrix-free simplex and hybrid mesh extension", "matrix-free simplex hybrid mesh adaptive mesh refinement", 850),
+                make_entry(24, "Additional operator kernel study", "matrix-free tensor product DG operator application", 840),
+                make_entry(25, "Additional portability study", "matrix-free performance portability on amd and intel gpu", 830),
+            ]
+        )
+
+        prepared, meta = _prepare_digest_entries_for_variant(
+            topic,
+            entries,
+            {},
+            variant_id="poe",
+            entry_limit=12,
+            variant_label="poe",
+        )
+
+        self.assertEqual(len(prepared), 14)
+        self.assertTrue(str(meta["selection_mode"]).startswith("hybrid_top_"))
+        bucket_counts = meta["bucket_counts"]
+        self.assertIn("frameworks", bucket_counts)
+        self.assertIn("operator_kernels", bucket_counts)
+        self.assertIn("gpu_portability", bucket_counts)
+        self.assertIn("multigrid", bucket_counts)
+        self.assertIn("mesh_generalization", bucket_counts)
+        scores = [entry.score for entry in prepared]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_ai_digest_selection_avoids_attention_only_top_slice(self) -> None:
+        topic = TopicConfig(
+            id="ai_operator_acceleration",
+            display_name="AI 算子加速",
+            description="desc",
+            source_queries={},
+        )
+
+        def make_entry(idx: int, title: str, abstract: str, score: float) -> ReportEntry:
+            return ReportEntry(
+                topic_id=topic.id,
+                topic_name=topic.display_name,
+                score=score,
+                classification="relevant",
+                matched_keywords=["kernel"],
+                reasons=["fixture"],
+                source_names=["seed"],
+                source_urls=[],
+                paper=PaperRecord(
+                    id=idx,
+                    title=title,
+                    title_norm=title.lower(),
+                    abstract=abstract,
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://example.com",
+                    pdf_url="https://example.com/paper.pdf",
+                    doi="",
+                    arxiv_id="",
+                    venue="arXiv",
+                    year=2026,
+                    categories=[],
+                    summary_text=abstract,
+                    summary_basis="llm+abstract+metadata",
+                    tags=[],
+                    pdf_local_path="",
+                    pdf_status="pending",
+                    pdf_downloaded_at=None,
+                    fulltext_txt_path="",
+                    fulltext_excerpt="",
+                    fulltext_status="empty",
+                    page_count=None,
+                    llm_summary={},
+                    analysis_updated_at=None,
+                    source_first="seed",
+                    created_at="2026-03-10T09:00:00+08:00",
+                    last_seen_at="2026-03-10T09:00:00+08:00",
+                    metadata={},
+                ),
+            )
+
+        entries = [
+            make_entry(i + 100, f"FlashAttention variant {i}", "attention kernel optimization on Hopper", 1000 - i)
+            for i in range(14)
+        ]
+        entries.extend(
+            [
+                make_entry(120, "CUTLASS GEMM Tensor Core kernels", "gemm matmul cutlass tensor core wgmma", 870),
+                make_entry(121, "MLIR and Triton compiler stack for AI kernels", "mlir triton compiler tiling", 860),
+                make_entry(122, "Kernel fusion runtime for LLM inference", "kernel fusion runtime vllm inference system", 850),
+                make_entry(123, "ARM SME vectorization for transformer kernels", "arm sve sme simd kernel acceleration", 840),
+                make_entry(124, "Additional TVM compiler autotuning", "tvm compiler autotuning tensor core", 830),
+                make_entry(125, "Additional fusion training runtime", "training runtime fusion system", 820),
+            ]
+        )
+
+        summaries = {
+            120: [PaperLLMSummary(120, "poe", "poe", "openai_compatible", "https://api.example.com", "claude", "summary", "llm+pdf+metadata", [], {}, {}, "2026-03-10", "2026-03-10")],
+            121: [PaperLLMSummary(121, "poe", "poe", "openai_compatible", "https://api.example.com", "claude", "summary", "llm+pdf+metadata", [], {}, {}, "2026-03-10", "2026-03-10")],
+            122: [PaperLLMSummary(122, "poe", "poe", "openai_compatible", "https://api.example.com", "claude", "summary", "llm+pdf+metadata", [], {}, {}, "2026-03-10", "2026-03-10")],
+            123: [PaperLLMSummary(123, "poe", "poe", "openai_compatible", "https://api.example.com", "claude", "summary", "llm+pdf+metadata", [], {}, {}, "2026-03-10", "2026-03-10")],
+        }
+
+        prepared, meta = _prepare_digest_entries_for_variant(
+            topic,
+            entries,
+            summaries,
+            variant_id="poe",
+            entry_limit=12,
+            variant_label="poe",
+        )
+
+        self.assertEqual(len(prepared), 16)
+        self.assertTrue(str(meta["selection_mode"]).startswith("hybrid_top_"))
+        bucket_counts = meta["bucket_counts"]
+        self.assertIn("attention_kernels", bucket_counts)
+        self.assertIn("gemm_tensorcore", bucket_counts)
+        self.assertIn("compiler_stack", bucket_counts)
+        self.assertIn("fusion_runtime_system", bucket_counts)
+        self.assertIn("cpu_vector_arch", bucket_counts)
+        scores = [entry.score for entry in prepared]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_report_renders_fulltext_scope_and_structured_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3142,9 +3595,10 @@ class MonitorPipelineTest(unittest.TestCase):
                 lookback_days=1,
                 llm_client=FakeRenderClient(),
             )
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            html = Path(paths["html"]).read_text(encoding="utf-8")
-            export = Path(paths["json"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "daily-2026-03-10--matrix_free_fem.md").read_text(encoding="utf-8")
+            html = (topic_dir / "daily-2026-03-10--matrix_free_fem.html").read_text(encoding="utf-8")
+            export = (root / "exports" / "daily-2026-03-10--matrix_free_fem.json").read_text(encoding="utf-8")
 
             self.assertIn("输入依据：`已读取完整全文`", markdown)
             self.assertIn("本次总结读取了完整 PDF 提取全文，并按 4 个分块进行分析后聚合。", markdown)
@@ -3384,8 +3838,9 @@ class MonitorPipelineTest(unittest.TestCase):
             )
 
             paths = generate_catalog_report(db, settings)
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            export = Path(paths["json"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "matrix_free_fem.md").read_text(encoding="utf-8")
+            export = (root / "exports" / "catalog-matrix_free_fem.json").read_text(encoding="utf-8")
 
             self.assertIn("论文库总览", markdown)
             self.assertIn("Matrix-Free Preconditioners for High-Order FEM", markdown)
@@ -3396,6 +3851,61 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("\"variant_id\": \"poe\"", export)
             self.assertIn("\"variant_id\": \"ikun\"", export)
 
+            db.close()
+
+    def test_fetch_catalog_entries_orders_by_topic_then_score_desc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            source_config = FIXTURE_CONFIG_POE.read_text(encoding="utf-8")
+            (root / "config" / "config.json").write_text(source_config, encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            topic = next(item for item in settings.topics if item.id == "ai_operator_acceleration")
+
+            def add_candidate(index: int, title: str, score: float, published_at: str) -> None:
+                candidate = PaperCandidate(
+                    source_name="manual",
+                    source_paper_id=f"fixture-{index}",
+                    query_text="fixture",
+                    title=title,
+                    abstract="flashattention kernel implementation for transformer inference",
+                    authors=["Alice"],
+                    published_at=published_at,
+                    updated_at=published_at,
+                    primary_url=f"https://example.com/{index}",
+                    pdf_url="",
+                    doi="",
+                    arxiv_id="",
+                    venue="MLSys",
+                    year=int(published_at[:4]),
+                    categories=["cs.DC"],
+                    raw={"fixture": True},
+                )
+                paper_id, _ = db.upsert_paper(candidate)
+                db.upsert_match(
+                    paper_id,
+                    TopicEvaluation(
+                        topic_id=topic.id,
+                        topic_name=topic.display_name,
+                        score=score,
+                        classification="relevant",
+                        matched_keywords=["flashattention"],
+                        reasons=["fixture"],
+                    ),
+                )
+
+            add_candidate(1, "Lower Score Recent", 30.0, "2026-03-10")
+            add_candidate(2, "Higher Score Old", 70.0, "2024-03-10")
+            add_candidate(3, "Mid Score Newer", 50.0, "2026-03-20")
+
+            entries = [entry for entry in db.fetch_catalog_entries(include_maybe=True) if entry.topic_id == topic.id]
+            self.assertEqual(
+                [entry.paper.title for entry in entries[:3]],
+                ["Higher Score Old", "Mid Score Newer", "Lower Score Recent"],
+            )
             db.close()
 
     def test_generate_catalog_report_merges_requested_and_stored_variants(self) -> None:
@@ -3494,8 +4004,9 @@ class MonitorPipelineTest(unittest.TestCase):
             ]
 
             paths = generate_catalog_report(db, settings, llm_variants=variants)
-            markdown = Path(paths["markdown"]).read_text(encoding="utf-8")
-            export = Path(paths["json"]).read_text(encoding="utf-8")
+            topic_dir = Path(paths["topic_dir"])
+            markdown = (topic_dir / "matrix_free_fem.md").read_text(encoding="utf-8")
+            export = (root / "exports" / "catalog-matrix_free_fem.json").read_text(encoding="utf-8")
 
             self.assertIn("poe_gemini-3.1-pro", markdown)
             self.assertIn("ikun_gpt-5.4", markdown)
@@ -3503,6 +4014,81 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertIn("\"variant_id\": \"poe\"", export)
             self.assertIn("\"variant_id\": \"ikun\"", export)
             self.assertIn("\"variant_id\": \"legacy\"", export)
+
+            db.close()
+
+    def test_generate_catalog_report_writes_split_topic_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2603.00013",
+                    query_text="matrix-free finite element",
+                    title="GPU Matrix-Free FEM Benchmark",
+                    abstract="matrix-free finite element operator application benchmark on GPUs with performance portability",
+                    authors=["Alice"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2603.00013",
+                    pdf_url="https://arxiv.org/pdf/2603.00013.pdf",
+                    doi="",
+                    arxiv_id="2603.00013",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.NA"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+            pipeline._process_candidate(
+                PaperCandidate(
+                    source_name="arxiv",
+                    source_paper_id="2603.00014",
+                    query_text="flashattention triton compiler kernel fusion",
+                    title="CUTLASS and Triton for LLM Inference Kernels",
+                    abstract="We study CUTLASS, Triton, GEMM tiling, and transformer inference kernel fusion.",
+                    authors=["Bob"],
+                    published_at="2026-03-10T09:00:00+08:00",
+                    updated_at="2026-03-10T09:00:00+08:00",
+                    primary_url="https://arxiv.org/abs/2603.00014",
+                    pdf_url="https://arxiv.org/pdf/2603.00014.pdf",
+                    doi="",
+                    arxiv_id="2603.00014",
+                    venue="arXiv",
+                    year=2026,
+                    categories=["cs.LG"],
+                    raw={"fixture": True},
+                ),
+                RunStats(),
+            )
+
+            paths = generate_catalog_report(db, settings)
+
+            topic_dir = Path(paths["topic_dir"])
+            self.assertTrue(topic_dir.exists())
+            matrix_md = topic_dir / "matrix_free_fem.md"
+            ai_md = topic_dir / "ai_operator_acceleration.md"
+            matrix_json = root / "exports" / "catalog-matrix_free_fem.json"
+            ai_json = root / "exports" / "catalog-ai_operator_acceleration.json"
+            self.assertTrue(matrix_md.exists())
+            self.assertTrue(ai_md.exists())
+            self.assertTrue(matrix_json.exists())
+            self.assertTrue(ai_json.exists())
+            matrix_text = matrix_md.read_text(encoding="utf-8")
+            ai_text = ai_md.read_text(encoding="utf-8")
+            self.assertIn("## 有限元分析 Matrix-Free 算法优化", matrix_text)
+            self.assertNotIn("## AI 算子加速", matrix_text)
+            self.assertIn("## AI 算子加速", ai_text)
+            self.assertNotIn("## 有限元分析 Matrix-Free 算法优化", ai_text)
 
             db.close()
 

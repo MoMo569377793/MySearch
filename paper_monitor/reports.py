@@ -9,7 +9,7 @@ from pathlib import Path
 
 from paper_monitor.llm import LLMClient
 from paper_monitor.llm_registry import LLMRuntimeVariant
-from paper_monitor.models import PaperLLMSummary, PaperRecord, ReportEntry, Settings, TopicEvaluation
+from paper_monitor.models import PaperLLMSummary, PaperRecord, ReportEntry, Settings, TopicConfig, TopicEvaluation
 from paper_monitor.progress import ProgressBar
 from paper_monitor.storage import Database
 from paper_monitor.utils import ensure_directory, now_iso, shorten, stable_hash, to_day_bounds
@@ -66,6 +66,185 @@ def _entry_sort_key(entry: ReportEntry) -> tuple[float, str, int]:
 
 def _sorted_entries(entries: list[ReportEntry]) -> list[ReportEntry]:
     return sorted(entries, key=_entry_sort_key, reverse=True)
+
+
+def _digest_entry_text(entry: ReportEntry) -> str:
+    paper = entry.paper
+    parts = [
+        paper.title,
+        paper.abstract,
+        paper.summary_text,
+        paper.venue,
+        " ".join(entry.matched_keywords),
+        " ".join(paper.tags),
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _digest_bucket_for_entry(topic_id: str, entry: ReportEntry) -> str:
+    text = _digest_entry_text(entry)
+    if topic_id == "matrix_free_fem":
+        rules = [
+            ("frameworks", ["deal.ii", "dealii", "mfem", "nekrs", "nek5000", "libceed", "dune", "firedrake"]),
+            ("multigrid", ["multigrid", "precondition", "preconditioner", "solver"]),
+            ("mesh_generalization", ["simplex", "tetra", "tetrahed", "hybrid mesh", "adaptive mesh", "amr"]),
+            ("gpu_portability", ["gpu", "cuda", "hip", "sycl", "kokkos", "occa", "portability", "amd", "intel", "nvidia"]),
+            ("operator_kernels", ["sum factorization", "sum-factorization", "operator evaluation", "operator application", "discontinuous galerkin", " dg ", "tensor product"]),
+        ]
+        for bucket, keywords in rules:
+            if any(keyword in text for keyword in keywords):
+                return bucket
+        return "other"
+    if topic_id == "ai_operator_acceleration":
+        rules = [
+            ("attention_kernels", ["flashattention", "attention", "kv cache", "paged attention"]),
+            ("gemm_tensorcore", ["gemm", "matmul", "cutlass", "tensor core", "wgmma", "mma", "fp8"]),
+            ("compiler_stack", ["triton", "tvm", "mlir", "xla", "halide", "compiler", "autotuning", "tiling"]),
+            ("fusion_runtime_system", ["kernel fusion", "fusion", "vllm", "inference", "training", "runtime", "serving", "dispatch", "system"]),
+            ("cpu_vector_arch", ["sve", "sme", "arm", "vectorization", "simd", "cpu"]),
+        ]
+        for bucket, keywords in rules:
+            if any(keyword in text for keyword in keywords):
+                return bucket
+        return "other"
+    return "other"
+
+
+def _topic_digest_recommended_limit(topic_id: str, entry_limit: int) -> int:
+    base_limit = max(int(entry_limit or 0), 0)
+    if topic_id == "matrix_free_fem":
+        return max(base_limit, 14)
+    if topic_id == "ai_operator_acceleration":
+        return max(base_limit, 16)
+    return base_limit
+
+
+def _topic_bucket_order(topic_id: str) -> list[str]:
+    if topic_id == "matrix_free_fem":
+        return ["frameworks", "operator_kernels", "gpu_portability", "multigrid", "mesh_generalization", "other"]
+    if topic_id == "ai_operator_acceleration":
+        return ["attention_kernels", "gemm_tensorcore", "compiler_stack", "fusion_runtime_system", "cpu_vector_arch", "other"]
+    return ["other"]
+
+
+def _digest_bucket_display_name(topic_id: str, bucket_name: str) -> str:
+    labels = {
+        "matrix_free_fem": {
+            "frameworks": "框架/库",
+            "operator_kernels": "算子内核",
+            "gpu_portability": "GPU/可移植",
+            "multigrid": "多重网格/求解",
+            "mesh_generalization": "网格/几何扩展",
+            "other": "其他",
+        },
+        "ai_operator_acceleration": {
+            "attention_kernels": "Attention 内核",
+            "gemm_tensorcore": "GEMM/Tensor Core",
+            "compiler_stack": "编译器/IR",
+            "fusion_runtime_system": "Fusion/系统",
+            "cpu_vector_arch": "CPU/SIMD",
+            "other": "其他",
+        },
+    }
+    return labels.get(topic_id, {}).get(bucket_name, bucket_name)
+
+
+def _select_digest_entries(
+    topic: TopicConfig,
+    entries: list[ReportEntry],
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    *,
+    variant_id: str,
+    entry_limit: int,
+) -> tuple[list[ReportEntry], dict[str, object]]:
+    if not entries:
+        return [], {
+            "selection_mode": "none",
+            "bucket_counts": {},
+            "recommended_entry_limit": 0,
+            "core_entry_count": 0,
+        }
+
+    target_limit = _topic_digest_recommended_limit(topic.id, entry_limit)
+    if not target_limit:
+        selected_entries = list(entries)
+        bucket_counts: dict[str, int] = defaultdict(int)
+        for entry in selected_entries:
+            bucket_counts[_digest_bucket_for_entry(topic.id, entry)] += 1
+        return selected_entries, {
+            "selection_mode": "all",
+            "bucket_counts": dict(bucket_counts),
+            "recommended_entry_limit": len(selected_entries),
+            "core_entry_count": len(selected_entries),
+        }
+
+    target_limit = min(target_limit, len(entries))
+    if topic.id not in {"matrix_free_fem", "ai_operator_acceleration"}:
+        selected_entries = entries[:target_limit]
+        bucket_counts: dict[str, int] = defaultdict(int)
+        for entry in selected_entries:
+            bucket_counts[_digest_bucket_for_entry(topic.id, entry)] += 1
+        return selected_entries, {
+            "selection_mode": "all" if len(selected_entries) == len(entries) else f"top_{len(selected_entries)}",
+            "bucket_counts": dict(bucket_counts),
+            "recommended_entry_limit": target_limit,
+            "core_entry_count": len(selected_entries),
+        }
+
+    selected_ids: set[int] = set()
+    buckets: dict[str, list[ReportEntry]] = defaultdict(list)
+    summary_available = {
+        paper_id
+        for paper_id, summaries in paper_summaries_by_paper.items()
+        if any(item.variant_id == variant_id for item in summaries)
+    }
+    for entry in entries:
+        buckets[_digest_bucket_for_entry(topic.id, entry)].append(entry)
+
+    core_count = min(target_limit, max(6, target_limit // 2))
+    for entry in entries[:core_count]:
+        selected_ids.add(entry.paper.id)
+
+    bucket_order = _topic_bucket_order(topic.id)
+
+    def pick_next(bucket_name: str) -> ReportEntry | None:
+        candidates = buckets.get(bucket_name, [])
+        for entry in candidates:
+            if entry.paper.id not in selected_ids and entry.paper.id in summary_available:
+                return entry
+        for entry in candidates:
+            if entry.paper.id not in selected_ids:
+                return entry
+        return None
+
+    while len(selected_ids) < target_limit:
+        added = False
+        for bucket_name in bucket_order:
+            candidate = pick_next(bucket_name)
+            if candidate is None:
+                continue
+            selected_ids.add(candidate.paper.id)
+            added = True
+            if len(selected_ids) >= target_limit:
+                break
+        if not added:
+            break
+
+    for entry in entries:
+        if len(selected_ids) >= target_limit:
+            break
+        selected_ids.add(entry.paper.id)
+
+    selected_entries = [entry for entry in entries if entry.paper.id in selected_ids]
+    bucket_counts: dict[str, int] = defaultdict(int)
+    for entry in selected_entries:
+        bucket_counts[_digest_bucket_for_entry(topic.id, entry)] += 1
+    return selected_entries, {
+        "selection_mode": f"hybrid_top_{core_count}_bucketed_{max(len(selected_entries) - core_count, 0)}",
+        "bucket_counts": dict(bucket_counts),
+        "recommended_entry_limit": target_limit,
+        "core_entry_count": core_count,
+    }
 
 
 def _fallback_review_window_days(report_type: str, topic_id: str) -> int:
@@ -204,6 +383,7 @@ def _collect_topic_digests_by_variant(
         for topic in settings.topics:
             topic_entries = _sorted_entries(grouped_entries.get(topic.id, []))
             prepared_entries, digest_input_meta = _prepare_digest_entries_for_variant(
+                topic,
                 topic_entries,
                 paper_summaries_by_paper,
                 variant_id=variant_id,
@@ -240,6 +420,7 @@ def _collect_topic_digests_by_variant(
 
 
 def _prepare_digest_entries_for_variant(
+    topic: TopicConfig,
     entries: list[ReportEntry],
     paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
     *,
@@ -247,7 +428,13 @@ def _prepare_digest_entries_for_variant(
     entry_limit: int,
     variant_label: str,
 ) -> tuple[list[ReportEntry], dict[str, object]]:
-    selected_entries = entries[: max(int(entry_limit or 0), 0)] if entry_limit else list(entries)
+    selected_entries, selection_meta = _select_digest_entries(
+        topic,
+        entries,
+        paper_summaries_by_paper,
+        variant_id=variant_id,
+        entry_limit=entry_limit,
+    )
     prepared_entries: list[ReportEntry] = []
     input_papers: list[dict[str, object]] = []
     used_variant_count = 0
@@ -287,12 +474,20 @@ def _prepare_digest_entries_for_variant(
                 "summary_source": source_label,
                 "summary_scope": scope_label,
                 "summary_scope_note": scope_note,
+                "digest_bucket": _digest_bucket_for_entry(topic.id, entry),
             }
         )
     return prepared_entries, {
+        "topic_id": topic.id,
         "available_entry_count": len(entries),
         "selected_entry_count": len(selected_entries),
-        "selection_mode": "all" if len(selected_entries) == len(entries) else f"top_{len(selected_entries)}",
+        "selection_mode": selection_meta.get(
+            "selection_mode",
+            "all" if len(selected_entries) == len(entries) else f"top_{len(selected_entries)}",
+        ),
+        "bucket_counts": selection_meta.get("bucket_counts", {}),
+        "recommended_entry_limit": selection_meta.get("recommended_entry_limit", len(selected_entries)),
+        "core_entry_count": selection_meta.get("core_entry_count", len(selected_entries)),
         "variant_summary_count": used_variant_count,
         "fallback_summary_count": fallback_count,
         "input_papers": input_papers,
@@ -377,8 +572,10 @@ def _digest_input_meta_lines(digest: dict) -> list[str]:
     selected = input_meta.get("selected_entry_count", 0)
     available = input_meta.get("available_entry_count", 0)
     selection_mode = str(input_meta.get("selection_mode", "")).strip() or "unknown"
+    topic_id = str(input_meta.get("topic_id", "")).strip()
     variant_summary_count = input_meta.get("variant_summary_count", 0)
     fallback_summary_count = input_meta.get("fallback_summary_count", 0)
+    bucket_counts = input_meta.get("bucket_counts", {}) if isinstance(input_meta.get("bucket_counts"), dict) else {}
     input_papers = input_meta.get("input_papers", []) if isinstance(input_meta.get("input_papers"), list) else []
     preview = " | ".join(
         f"#{item.get('paper_id')} {item.get('title')} [{item.get('summary_source')}/{item.get('summary_scope')}]"
@@ -389,6 +586,13 @@ def _digest_input_meta_lines(digest: dict) -> list[str]:
         f"- 聚合输入：使用 `{selected}/{available}` 篇论文（`{selection_mode}`）",
         f"- 逐篇总结来源：本模型总结 `{variant_summary_count}` 篇，回退默认总结 `{fallback_summary_count}` 篇",
     ]
+    if bucket_counts:
+        bucket_summary = " | ".join(
+            f"{_digest_bucket_display_name(topic_id, bucket)} {count}"
+            for bucket, count in sorted(bucket_counts.items(), key=lambda item: (-int(item[1]), item[0]))
+        )
+        if bucket_summary:
+            lines.append(f"- 子方向覆盖：`{bucket_summary}`")
     if preview:
         suffix = " | ..." if len(input_papers) > 5 else ""
         lines.append(f"- 输入论文：`{preview}{suffix}`")
@@ -402,8 +606,10 @@ def _digest_input_meta_html(digest: dict) -> str:
     selected = input_meta.get("selected_entry_count", 0)
     available = input_meta.get("available_entry_count", 0)
     selection_mode = str(input_meta.get("selection_mode", "")).strip() or "unknown"
+    topic_id = str(input_meta.get("topic_id", "")).strip()
     variant_summary_count = input_meta.get("variant_summary_count", 0)
     fallback_summary_count = input_meta.get("fallback_summary_count", 0)
+    bucket_counts = input_meta.get("bucket_counts", {}) if isinstance(input_meta.get("bucket_counts"), dict) else {}
     input_papers = input_meta.get("input_papers", []) if isinstance(input_meta.get("input_papers"), list) else []
     preview = " | ".join(
         f"#{item.get('paper_id')} {item.get('title')} [{item.get('summary_source')}/{item.get('summary_scope')}]"
@@ -415,11 +621,20 @@ def _digest_input_meta_html(digest: dict) -> str:
         if preview
         else ""
     )
+    bucket_html = ""
+    if bucket_counts:
+        bucket_summary = " | ".join(
+            f"{_digest_bucket_display_name(topic_id, bucket)} {count}"
+            for bucket, count in sorted(bucket_counts.items(), key=lambda item: (-int(item[1]), item[0]))
+        )
+        if bucket_summary:
+            bucket_html = f"<p><strong>子方向覆盖：</strong>{html.escape(bucket_summary)}</p>"
     return (
         f"<p><strong>聚合输入：</strong>{html.escape(str(selected))}/{html.escape(str(available))} 篇"
         f"（{html.escape(selection_mode)}）</p>"
         f"<p><strong>逐篇总结来源：</strong>本模型总结 {html.escape(str(variant_summary_count))} 篇，"
         f"回退默认总结 {html.escape(str(fallback_summary_count))} 篇</p>"
+        f"{bucket_html}"
         f"{preview_html}"
     )
 
@@ -1089,6 +1304,235 @@ def _serialize_variants(variants: list[LLMRuntimeVariant | dict]) -> list[dict[s
     ]
 
 
+def _summary_payload(summary: PaperLLMSummary) -> dict:
+    return {
+        "variant_id": summary.variant_id,
+        "variant_label": summary.variant_label,
+        "model": summary.model,
+        "summary_text": summary.summary_text,
+        "summary_basis": summary.summary_basis,
+        "summary_scope": _summary_scope_label(summary),
+        "summary_scope_note": _summary_scope_note(summary),
+        "source_mode": (
+            summary.structured.get("source_mode", "")
+            if isinstance(summary.structured, dict)
+            else ""
+        ),
+        "pdf_input_strategy": (
+            summary.structured.get("pdf_input_strategy", "")
+            if isinstance(summary.structured, dict)
+            else ""
+        ),
+        "direct_pdf_strategy": (
+            summary.structured.get("direct_pdf_strategy", "")
+            if isinstance(summary.structured, dict)
+            else ""
+        ),
+        "direct_pdf_status": (
+            summary.structured.get("direct_pdf_status", "")
+            if isinstance(summary.structured, dict)
+            else ""
+        ),
+        "chunk_count": (
+            summary.structured.get("chunk_count")
+            if isinstance(summary.structured, dict)
+            else None
+        ),
+        "structured": summary.structured,
+        "usage": summary.usage,
+    }
+
+
+def _catalog_entry_payload(
+    entry: ReportEntry,
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    paper_report_outputs: dict[int, dict[str, str]],
+) -> dict:
+    return {
+        "topic_name": entry.topic_name,
+        "score": entry.score,
+        "classification": entry.classification,
+        "matched_keywords": entry.matched_keywords,
+        "paper": {
+            "id": entry.paper.id,
+            "title": entry.paper.title,
+            "published_at": entry.paper.published_at,
+            "created_at": entry.paper.created_at,
+            "primary_url": entry.paper.primary_url,
+            "summary_text": entry.paper.summary_text,
+            "summary_basis": entry.paper.summary_basis,
+            "paper_report": paper_report_outputs.get(entry.paper.id, {}),
+            "llm_summaries": [
+                _summary_payload(summary)
+                for summary in paper_summaries_by_paper.get(entry.paper.id, [])
+            ],
+        },
+    }
+
+
+def _report_entry_payload(
+    entry: ReportEntry,
+    paper_summaries_by_paper: dict[int, list[PaperLLMSummary]],
+    paper_report_outputs: dict[int, dict[str, str]],
+) -> dict:
+    return {
+        "topic_name": entry.topic_name,
+        "score": entry.score,
+        "classification": entry.classification,
+        "matched_keywords": entry.matched_keywords,
+        "reasons": entry.reasons,
+        "paper": {
+            "id": entry.paper.id,
+            "title": entry.paper.title,
+            "published_at": entry.paper.published_at,
+            "primary_url": entry.paper.primary_url,
+            "summary_text": entry.paper.summary_text,
+            "summary_basis": entry.paper.summary_basis,
+            "venue": entry.paper.venue,
+            "categories": entry.paper.categories,
+            "pdf_status": entry.paper.pdf_status,
+            "pdf_local_path": entry.paper.pdf_local_path,
+            "fulltext_status": entry.paper.fulltext_status,
+            "fulltext_txt_path": entry.paper.fulltext_txt_path,
+            "page_count": entry.paper.page_count,
+            "llm_summaries": [
+                _summary_payload(summary)
+                for summary in paper_summaries_by_paper.get(entry.paper.id, [])
+            ],
+            "paper_report": paper_report_outputs.get(entry.paper.id, {}),
+        },
+    }
+
+
+def _filter_topic_digests(
+    topic_digests_by_variant: dict[str, dict[str, dict]],
+    topic_id: str,
+) -> dict[str, dict[str, dict]]:
+    filtered: dict[str, dict[str, dict]] = {}
+    for variant_id, items in topic_digests_by_variant.items():
+        digest = items.get(topic_id)
+        if digest:
+            filtered[variant_id] = {topic_id: digest}
+    return filtered
+
+
+def _write_report_output_bundle(
+    report_root: Path,
+    export_root: Path,
+    report_stem: str,
+    export_stem: str,
+    markdown_text: str,
+    html_text: str,
+    json_payload: dict,
+) -> dict[str, str]:
+    ensure_directory(report_root)
+    ensure_directory(export_root)
+    markdown_path = report_root / f"{report_stem}.md"
+    html_path = report_root / f"{report_stem}.html"
+    json_path = export_root / f"{export_stem}.json"
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+    html_path.write_text(html_text, encoding="utf-8")
+    json_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "markdown": str(markdown_path),
+        "html": str(html_path),
+        "json": str(json_path),
+    }
+
+
+def _render_topic_split_index_markdown(
+    title: str,
+    meta_lines: list[str],
+    topic_outputs: dict[str, dict[str, str]],
+    settings: Settings,
+) -> str:
+    lines = [f"# {title}", ""]
+    lines.extend(meta_lines)
+    lines.append("")
+    lines.append("本次不再输出按主题拼接的合并正文，正文请直接查看各主题独立文件：")
+    lines.append("")
+    for topic in settings.topics:
+        outputs = topic_outputs.get(topic.id, {})
+        lines.append(f"## {topic.display_name}")
+        lines.append("")
+        lines.append(f"- Markdown：`{outputs.get('markdown', '')}`")
+        lines.append(f"- HTML：`{outputs.get('html', '')}`")
+        lines.append(f"- JSON：`{outputs.get('json', '')}`")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _render_topic_split_index_html(
+    title: str,
+    meta_lines: list[str],
+    topic_outputs: dict[str, dict[str, str]],
+    settings: Settings,
+) -> str:
+    meta_html = "".join(f"<p class=\"meta\">{html.escape(line.lstrip('- ').strip())}</p>" for line in meta_lines)
+    sections: list[str] = []
+    for topic in settings.topics:
+        outputs = topic_outputs.get(topic.id, {})
+        sections.append(
+            f"""
+            <section class="topic-section">
+              <h2>{html.escape(topic.display_name)}</h2>
+              <p>{html.escape(topic.description)}</p>
+              <p><strong>Markdown：</strong><code>{html.escape(outputs.get('markdown', ''))}</code></p>
+              <p><strong>HTML：</strong><code>{html.escape(outputs.get('html', ''))}</code></p>
+              <p><strong>JSON：</strong><code>{html.escape(outputs.get('json', ''))}</code></p>
+            </section>
+            """
+        )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", sans-serif;
+      color: #18222d;
+      background: #f7f3eb;
+      line-height: 1.6;
+    }}
+    main {{
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }}
+    header, section {{
+      background: #fffdf8;
+      border: 1px solid #d7d0c3;
+      border-radius: 18px;
+      padding: 20px;
+      margin-bottom: 18px;
+    }}
+    .meta {{
+      color: #52606d;
+      font-size: 0.96rem;
+      margin: 6px 0;
+    }}
+    code {{
+      word-break: break-all;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>{html.escape(title)}</h1>
+      {meta_html}
+      <p>本次不再输出按主题拼接的合并正文，正文请直接查看下面两个主题独立文件。</p>
+    </header>
+    {''.join(sections)}
+  </main>
+</body>
+</html>
+"""
+
+
 def _active_variant_count(variants: list[LLMRuntimeVariant | dict]) -> int:
     return sum(1 for variant in variants if _variant_attr(variant, "client") and _variant_attr(variant, "client").enabled)
 
@@ -1684,82 +2128,99 @@ def generate_catalog_report(
     ensure_directory(report_root)
     ensure_directory(settings.export_dir)
 
-    progress_bar.advance(detail="渲染 Markdown")
-    markdown_text = _render_catalog_markdown(
-        generated_at,
-        grouped_entries,
-        visible_summaries_by_paper,
-        topic_digests_by_variant,
-        display_variants,
-        settings,
-    )
-    progress_bar.advance(detail="渲染 HTML")
-    html_text = _render_catalog_html(
-        generated_at,
-        grouped_entries,
-        visible_summaries_by_paper,
-        topic_digests_by_variant,
-        display_variants,
-        settings,
-    )
-    progress_bar.advance(detail="导出 JSON 与写入文件")
-    json_text = json.dumps(
-        {
+    topic_report_root = report_root / "topics"
+    topic_outputs: dict[str, dict[str, str]] = {}
+    progress_bar.advance(detail="渲染各主题 Markdown/HTML/JSON")
+    for topic in settings.topics:
+        topic_settings = replace(settings, topics=[topic])
+        topic_grouped_entries = {topic.id: _sorted_entries(grouped_entries.get(topic.id, []))}
+        topic_digests = _filter_topic_digests(topic_digests_by_variant, topic.id)
+        topic_markdown = _render_catalog_markdown(
+            generated_at,
+            topic_grouped_entries,
+            visible_summaries_by_paper,
+            topic_digests,
+            display_variants,
+            topic_settings,
+        )
+        topic_html = _render_catalog_html(
+            generated_at,
+            topic_grouped_entries,
+            visible_summaries_by_paper,
+            topic_digests,
+            display_variants,
+            topic_settings,
+        )
+        topic_payload = {
             "generated_at": generated_at,
+            "topic": {
+                "id": topic.id,
+                "display_name": topic.display_name,
+                "description": topic.description,
+            },
             "variants": _serialize_variants(display_variants),
-            "topic_digests": topic_digests_by_variant,
+            "topic_digests": topic_digests,
             "topics": {
                 topic.id: [
-                    {
-                        "topic_name": entry.topic_name,
-                        "score": entry.score,
-                        "classification": entry.classification,
-                        "matched_keywords": entry.matched_keywords,
-                        "paper": {
-                            "id": entry.paper.id,
-                            "title": entry.paper.title,
-                            "published_at": entry.paper.published_at,
-                            "created_at": entry.paper.created_at,
-                            "primary_url": entry.paper.primary_url,
-                            "summary_text": entry.paper.summary_text,
-                            "summary_basis": entry.paper.summary_basis,
-                            "paper_report": paper_report_outputs.get(entry.paper.id, {}),
-                            "llm_summaries": [
-                                {
-                                    "variant_id": summary.variant_id,
-                                    "variant_label": summary.variant_label,
-                                    "model": summary.model,
-                                    "summary_text": summary.summary_text,
-                                    "summary_basis": summary.summary_basis,
-                                    "summary_scope": _summary_scope_label(summary),
-                                    "summary_scope_note": _summary_scope_note(summary),
-                                    "structured": summary.structured,
-                                }
-                                for summary in visible_summaries_by_paper.get(entry.paper.id, [])
-                            ],
-                        },
-                    }
-                    for entry in _sorted_entries(grouped_entries.get(topic.id, []))
+                    _catalog_entry_payload(entry, visible_summaries_by_paper, paper_report_outputs)
+                    for entry in topic_grouped_entries.get(topic.id, [])
                 ]
-                for topic in settings.topics
             },
-        },
-        ensure_ascii=False,
-        indent=2,
+        }
+        topic_outputs[topic.id] = _write_report_output_bundle(
+            topic_report_root,
+            settings.export_dir,
+            topic.id,
+            f"catalog-{topic.id}",
+            topic_markdown,
+            topic_html,
+            topic_payload,
+        )
+    progress_bar.advance(detail="写入索引文件")
+    index_markdown = _render_topic_split_index_markdown(
+        "论文库总览",
+        [
+            f"- 生成时间：`{generated_at}`",
+            f"- 主题数量：`{len(settings.topics)}`",
+            f"- 论文条目数：`{sum(len(items) for items in grouped_entries.values())}`",
+            f"- 去重后论文数：`{len({entry.paper.id for items in grouped_entries.values() for entry in items})}`",
+        ],
+        topic_outputs,
+        settings,
     )
-
-    path_md = report_root / "current.md"
-    path_html = report_root / "current.html"
-    path_json = settings.export_dir / "catalog-current.json"
-    path_md.write_text(markdown_text, encoding="utf-8")
-    path_html.write_text(html_text, encoding="utf-8")
-    path_json.write_text(json_text + "\n", encoding="utf-8")
+    index_html = _render_topic_split_index_html(
+        "论文库总览",
+        [
+            f"- 生成时间：{generated_at}",
+            f"- 主题数量：{len(settings.topics)}",
+            f"- 论文条目数：{sum(len(items) for items in grouped_entries.values())}",
+            f"- 去重后论文数：{len({entry.paper.id for items in grouped_entries.values() for entry in items})}",
+        ],
+        topic_outputs,
+        settings,
+    )
+    index_payload = {
+        "generated_at": generated_at,
+        "index_only": True,
+        "topic_outputs": topic_outputs,
+        "variants": _serialize_variants(display_variants),
+    }
+    combined_paths = _write_report_output_bundle(
+        report_root,
+        settings.export_dir,
+        "current",
+        "catalog-current",
+        index_markdown,
+        index_html,
+        index_payload,
+    )
     progress_bar.close("论文库总览已生成")
     return {
-        "markdown": str(path_md),
-        "html": str(path_html),
-        "json": str(path_json),
+        "markdown": combined_paths["markdown"],
+        "html": combined_paths["html"],
+        "json": combined_paths["json"],
         "papers_dir": str(settings.report_dir / "papers"),
+        "topic_dir": str(topic_report_root),
     }
 
 
@@ -2018,198 +2479,132 @@ def generate_report(
         llm_variants=display_variants,
     )
 
-    progress_bar.advance(detail="渲染 Markdown")
-    markdown_text = _render_markdown(
-        report_type,
-        report_date,
-        start_at,
-        end_at,
-        grouped_entries,
-        fallback_entries_by_topic,
-        fallback_days_by_topic,
-        visible_summaries_by_paper,
-        topic_digests_by_variant,
-        display_variants,
-        settings,
-    )
-    progress_bar.advance(detail="渲染 HTML")
-    html_text = _render_html(
-        report_type,
-        report_date,
-        start_at,
-        end_at,
-        grouped_entries,
-        fallback_entries_by_topic,
-        fallback_days_by_topic,
-        visible_summaries_by_paper,
-        topic_digests_by_variant,
-        display_variants,
-        settings,
-    )
-    progress_bar.advance(detail="导出 JSON 与写入文件")
-    json_text = json.dumps(
-        {
+    topic_report_root = report_root / "topics"
+    topic_outputs: dict[str, dict[str, str]] = {}
+    progress_bar.advance(detail="渲染各主题 Markdown/HTML/JSON")
+    for topic in settings.topics:
+        topic_settings = replace(settings, topics=[topic])
+        topic_grouped_entries = {topic.id: _sorted_entries(grouped_entries.get(topic.id, []))}
+        topic_fallback_entries = {}
+        if topic.id in fallback_entries_by_topic:
+            topic_fallback_entries[topic.id] = _sorted_entries(fallback_entries_by_topic[topic.id])
+        topic_fallback_days = {}
+        if topic.id in fallback_days_by_topic:
+            topic_fallback_days[topic.id] = fallback_days_by_topic[topic.id]
+        topic_digests = _filter_topic_digests(topic_digests_by_variant, topic.id)
+        topic_markdown = _render_markdown(
+            report_type,
+            report_date,
+            start_at,
+            end_at,
+            topic_grouped_entries,
+            topic_fallback_entries,
+            topic_fallback_days,
+            visible_summaries_by_paper,
+            topic_digests,
+            display_variants,
+            topic_settings,
+        )
+        topic_html = _render_html(
+            report_type,
+            report_date,
+            start_at,
+            end_at,
+            topic_grouped_entries,
+            topic_fallback_entries,
+            topic_fallback_days,
+            visible_summaries_by_paper,
+            topic_digests,
+            display_variants,
+            topic_settings,
+        )
+        topic_payload = {
             "report_type": report_type,
             "report_date": report_date,
             "start_at": start_at,
             "end_at": end_at,
+            "topic": {
+                "id": topic.id,
+                "display_name": topic.display_name,
+                "description": topic.description,
+            },
             "variants": _serialize_variants(display_variants),
-            "topic_digests": topic_digests_by_variant,
+            "topic_digests": topic_digests,
             "topics": {
-                topic_id: [
-                    {
-                        "topic_name": entry.topic_name,
-                        "score": entry.score,
-                        "classification": entry.classification,
-                        "matched_keywords": entry.matched_keywords,
-                        "reasons": entry.reasons,
-                        "paper": {
-                            "title": entry.paper.title,
-                            "published_at": entry.paper.published_at,
-                            "primary_url": entry.paper.primary_url,
-                            "summary_text": entry.paper.summary_text,
-                            "summary_basis": entry.paper.summary_basis,
-                            "venue": entry.paper.venue,
-                            "categories": entry.paper.categories,
-                            "pdf_status": entry.paper.pdf_status,
-                            "pdf_local_path": entry.paper.pdf_local_path,
-                            "fulltext_status": entry.paper.fulltext_status,
-                            "fulltext_txt_path": entry.paper.fulltext_txt_path,
-                            "page_count": entry.paper.page_count,
-                            "llm_summaries": [
-                                {
-                                    "variant_id": summary.variant_id,
-                                    "variant_label": summary.variant_label,
-                                    "model": summary.model,
-                                    "summary_text": summary.summary_text,
-                                    "summary_basis": summary.summary_basis,
-                                    "summary_scope": _summary_scope_label(summary),
-                                    "summary_scope_note": _summary_scope_note(summary),
-                                    "source_mode": (
-                                        summary.structured.get("source_mode", "")
-                                        if isinstance(summary.structured, dict)
-                                        else ""
-                                    ),
-                                    "pdf_input_strategy": (
-                                        summary.structured.get("pdf_input_strategy", "")
-                                        if isinstance(summary.structured, dict)
-                                        else ""
-                                    ),
-                                    "direct_pdf_strategy": (
-                                        summary.structured.get("direct_pdf_strategy", "")
-                                        if isinstance(summary.structured, dict)
-                                        else ""
-                                    ),
-                                    "direct_pdf_status": (
-                                        summary.structured.get("direct_pdf_status", "")
-                                        if isinstance(summary.structured, dict)
-                                        else ""
-                                    ),
-                                    "chunk_count": (
-                                        summary.structured.get("chunk_count")
-                                        if isinstance(summary.structured, dict)
-                                        else None
-                                    ),
-                                    "structured": summary.structured,
-                                    "usage": summary.usage,
-                                }
-                                for summary in visible_summaries_by_paper.get(entry.paper.id, [])
-                            ],
-                            "paper_report": paper_report_outputs.get(entry.paper.id, {}),
-                        },
-                    }
-                    for entry in topic_entries
+                topic.id: [
+                    _report_entry_payload(entry, visible_summaries_by_paper, paper_report_outputs)
+                    for entry in topic_grouped_entries.get(topic.id, [])
                 ]
-                for topic_id, topic_entries in grouped_entries.items()
             },
-            "fallback_reviews": {
-                topic_id: {
-                    "days": fallback_days_by_topic[topic_id],
-                    "entries": [
-                        {
-                            "topic_name": entry.topic_name,
-                            "score": entry.score,
-                            "classification": entry.classification,
-                            "matched_keywords": entry.matched_keywords,
-                            "reasons": entry.reasons,
-                            "paper": {
-                                "title": entry.paper.title,
-                                "published_at": entry.paper.published_at,
-                                "primary_url": entry.paper.primary_url,
-                                "summary_text": entry.paper.summary_text,
-                                "summary_basis": entry.paper.summary_basis,
-                                "venue": entry.paper.venue,
-                                "categories": entry.paper.categories,
-                                "pdf_status": entry.paper.pdf_status,
-                                "pdf_local_path": entry.paper.pdf_local_path,
-                                "fulltext_status": entry.paper.fulltext_status,
-                                "fulltext_txt_path": entry.paper.fulltext_txt_path,
-                                "page_count": entry.paper.page_count,
-                                "llm_summaries": [
-                                    {
-                                        "variant_id": summary.variant_id,
-                                        "variant_label": summary.variant_label,
-                                        "model": summary.model,
-                                        "summary_text": summary.summary_text,
-                                        "summary_basis": summary.summary_basis,
-                                        "summary_scope": _summary_scope_label(summary),
-                                        "summary_scope_note": _summary_scope_note(summary),
-                                        "source_mode": (
-                                            summary.structured.get("source_mode", "")
-                                            if isinstance(summary.structured, dict)
-                                            else ""
-                                        ),
-                                        "pdf_input_strategy": (
-                                            summary.structured.get("pdf_input_strategy", "")
-                                            if isinstance(summary.structured, dict)
-                                            else ""
-                                        ),
-                                        "direct_pdf_strategy": (
-                                            summary.structured.get("direct_pdf_strategy", "")
-                                            if isinstance(summary.structured, dict)
-                                            else ""
-                                        ),
-                                        "direct_pdf_status": (
-                                            summary.structured.get("direct_pdf_status", "")
-                                            if isinstance(summary.structured, dict)
-                                            else ""
-                                        ),
-                                        "chunk_count": (
-                                            summary.structured.get("chunk_count")
-                                            if isinstance(summary.structured, dict)
-                                            else None
-                                        ),
-                                        "structured": summary.structured,
-                                        "usage": summary.usage,
-                                    }
-                                    for summary in visible_summaries_by_paper.get(entry.paper.id, [])
-                                ],
-                                "paper_report": paper_report_outputs.get(entry.paper.id, {}),
-                            },
-                        }
-                        for entry in topic_entries
-                    ],
+            "fallback_reviews": (
+                {
+                    topic.id: {
+                        "days": topic_fallback_days[topic.id],
+                        "entries": [
+                            _report_entry_payload(entry, visible_summaries_by_paper, paper_report_outputs)
+                            for entry in topic_fallback_entries.get(topic.id, [])
+                        ],
+                    }
                 }
-                for topic_id, topic_entries in fallback_entries_by_topic.items()
-            },
-        },
-        ensure_ascii=False,
-        indent=2,
+                if topic.id in topic_fallback_days
+                else {}
+            ),
+        }
+        topic_outputs[topic.id] = _write_report_output_bundle(
+            topic_report_root,
+            settings.export_dir,
+            f"{report_type}-{report_date}--{topic.id}",
+            f"{report_type}-{report_date}--{topic.id}",
+            topic_markdown,
+            topic_html,
+            topic_payload,
+        )
+    progress_bar.advance(detail="写入索引文件")
+    index_markdown = _render_topic_split_index_markdown(
+        f"论文监控{_report_label(report_type)} - {report_date}",
+        [
+            f"- 时间窗口：`{start_at}` 到 `{end_at}`",
+            f"- 主题数量：`{len(settings.topics)}`",
+            f"- LLM 模型数：`{len(display_variants)}`",
+        ],
+        topic_outputs,
+        settings,
     )
-
-    path_md = report_root / f"{report_date}.md"
-    path_html = report_root / f"{report_date}.html"
-    path_json = settings.export_dir / f"{report_type}-{report_date}.json"
-    path_md.write_text(markdown_text, encoding="utf-8")
-    path_html.write_text(html_text, encoding="utf-8")
-    path_json.write_text(json_text + "\n", encoding="utf-8")
+    index_html = _render_topic_split_index_html(
+        f"论文监控{_report_label(report_type)} - {report_date}",
+        [
+            f"- 时间窗口：{start_at} 到 {end_at}",
+            f"- 主题数量：{len(settings.topics)}",
+            f"- LLM 模型数：{len(display_variants)}",
+        ],
+        topic_outputs,
+        settings,
+    )
+    index_payload = {
+        "report_type": report_type,
+        "report_date": report_date,
+        "start_at": start_at,
+        "end_at": end_at,
+        "index_only": True,
+        "topic_outputs": topic_outputs,
+        "variants": _serialize_variants(display_variants),
+    }
+    combined_paths = _write_report_output_bundle(
+        report_root,
+        settings.export_dir,
+        report_date,
+        f"{report_type}-{report_date}",
+        index_markdown,
+        index_html,
+        index_payload,
+    )
 
     db.record_report(
         report_type=report_type,
         report_date=report_date,
-        path_md=str(path_md),
-        path_html=str(path_html),
-        path_json=str(path_json),
+        path_md=combined_paths["markdown"],
+        path_html=combined_paths["html"],
+        path_json=combined_paths["json"],
         meta={
             "match_count": len(entries),
             "lookback_days": actual_lookback,
@@ -2225,10 +2620,11 @@ def generate_report(
     progress_bar.close(f"{_report_label(report_type)}已生成 {report_date}")
 
     return {
-        "markdown": str(path_md),
-        "html": str(path_html),
-        "json": str(path_json),
+        "markdown": combined_paths["markdown"],
+        "html": combined_paths["html"],
+        "json": combined_paths["json"],
         "papers_dir": str(settings.report_dir / "papers"),
+        "topic_dir": str(topic_report_root),
     }
 
 

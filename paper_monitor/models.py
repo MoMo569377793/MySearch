@@ -12,6 +12,7 @@ class TopicConfig:
     description: str
     source_queries: dict[str, list[str]]
     required_keyword_groups: list[list[str]] = field(default_factory=list)
+    required_keyword_lanes: list[list[list[str]]] = field(default_factory=list)
     must_match_groups: list[list[str]] = field(default_factory=list)
     positive_keywords: list[str] = field(default_factory=list)
     exclude_keywords: list[str] = field(default_factory=list)

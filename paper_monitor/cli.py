@@ -695,9 +695,10 @@ def main(argv: list[str] | None = None) -> int:
                 topic_digest_variants=digest_variants,
                 use_llm_topic_digest=args.with_llm,
             )
-            print(f"报告已生成: {paths['markdown']}")
-            print(f"HTML: {paths['html']}")
-            print(f"JSON: {paths['json']}")
+            print(f"报告索引已生成: {paths['markdown']}")
+            print(f"HTML 索引: {paths['html']}")
+            print(f"JSON 索引: {paths['json']}")
+            print(f"主题拆分目录: {paths['topic_dir']}")
             print(f"单篇报告目录: {paths['papers_dir']}")
             return 0
 
@@ -711,9 +712,10 @@ def main(argv: list[str] | None = None) -> int:
                 topic_digest_variants=digest_variants,
                 use_llm_topic_digest=args.with_llm,
             )
-            print(f"总览报告已生成: {paths['markdown']}")
-            print(f"HTML: {paths['html']}")
-            print(f"JSON: {paths['json']}")
+            print(f"总览索引已生成: {paths['markdown']}")
+            print(f"HTML 索引: {paths['html']}")
+            print(f"JSON 索引: {paths['json']}")
+            print(f"主题拆分目录: {paths['topic_dir']}")
             print(f"单篇报告目录: {paths['papers_dir']}")
             return 0
 

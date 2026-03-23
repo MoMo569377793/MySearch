@@ -368,6 +368,7 @@
           "year": 2025,
           "venue": "Journal of Numerical Mathematics",
           "primary_url": "https://doi.org/10.1515/jnma-2025-0115",
+          "pdf_url": "https://dealii.org/deal97-preprint.pdf",
           "doi": "10.1515/jnma-2025-0115",
           "tags": [
             "curated-seed",
@@ -659,6 +660,8 @@
           ],
           "year": 2024,
           "venue": "arXiv",
+          "primary_url": "https://arxiv.org/abs/2407.08608",
+          "arxiv_id": "2407.08608",
           "tags": [
             "curated-seed",
             "flashattention"
@@ -673,6 +676,8 @@
           ],
           "year": 2019,
           "venue": "MPC / arXiv",
+          "primary_url": "https://doi.org/10.1145/3315508.3329973",
+          "doi": "10.1145/3315508.3329973",
           "tags": [
             "curated-seed",
             "triton"
@@ -697,6 +702,8 @@
           ],
           "year": 2018,
           "venue": "OSDI",
+          "primary_url": "https://arxiv.org/abs/1802.04799",
+          "arxiv_id": "1802.04799",
           "tags": [
             "curated-seed",
             "tvm"
@@ -756,6 +763,7 @@
           "year": 2009,
           "venue": "Communications of the ACM",
           "primary_url": "https://doi.org/10.1145/1498765.1498785",
+          "pdf_url": "https://zenodo.org/record/1236156/files/article.pdf?download=1",
           "doi": "10.1145/1498765.1498785",
           "tags": [
             "curated-seed",

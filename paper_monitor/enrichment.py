@@ -102,6 +102,7 @@ class DocumentProcessor:
         self.user_agent = user_agent
         self.timezone_name = timezone_name
         self.semantic_scholar_api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+        self._resolved_pdf_url_cache: dict[int, str] = {}
         self.has_pdftotext = bool(config.use_pdftotext and command_exists("pdftotext"))
         self.has_pdfinfo = command_exists("pdfinfo")
         ensure_directory(config.pdf_dir)
@@ -111,23 +112,39 @@ class DocumentProcessor:
         return bool(self.resolve_pdf_url(paper))
 
     def resolve_pdf_url(self, paper: PaperRecord) -> str:
+        cached = self._resolved_pdf_url_cache.get(paper.id)
+        if cached is not None:
+            return cached
         if self._looks_like_pdf_url(paper.pdf_url):
-            return paper.pdf_url
+            resolved = paper.pdf_url
+            self._resolved_pdf_url_cache[paper.id] = resolved
+            return resolved
         inferred_arxiv_id = self._infer_arxiv_id(paper)
         if inferred_arxiv_id:
-            return f"https://arxiv.org/pdf/{inferred_arxiv_id}.pdf"
+            resolved = f"https://arxiv.org/pdf/{inferred_arxiv_id}.pdf"
+            self._resolved_pdf_url_cache[paper.id] = resolved
+            return resolved
         if paper.arxiv_id:
-            return f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
+            resolved = f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf"
+            self._resolved_pdf_url_cache[paper.id] = resolved
+            return resolved
         if "/abs/" in paper.primary_url and "arxiv.org" in paper.primary_url:
-            return paper.primary_url.replace("/abs/", "/pdf/") + ".pdf"
+            resolved = paper.primary_url.replace("/abs/", "/pdf/") + ".pdf"
+            self._resolved_pdf_url_cache[paper.id] = resolved
+            return resolved
         inferred_landing_pdf = self._infer_pdf_url_from_landing_page(paper.primary_url)
         if inferred_landing_pdf:
+            self._resolved_pdf_url_cache[paper.id] = inferred_landing_pdf
             return inferred_landing_pdf
         inferred_semantic_scholar_pdf = self._infer_pdf_url_from_semantic_scholar(paper)
         if inferred_semantic_scholar_pdf:
+            self._resolved_pdf_url_cache[paper.id] = inferred_semantic_scholar_pdf
             return inferred_semantic_scholar_pdf
         if self._should_try_primary_url_as_pdf_candidate(paper):
-            return paper.primary_url.strip()
+            resolved = paper.primary_url.strip()
+            self._resolved_pdf_url_cache[paper.id] = resolved
+            return resolved
+        self._resolved_pdf_url_cache[paper.id] = ""
         return ""
 
     def enrich(self, paper: PaperRecord, force: bool = False) -> DocumentArtifacts:
@@ -205,9 +222,12 @@ class DocumentProcessor:
         lowered = url.lower().strip()
         if not lowered:
             return False
-        if lowered.endswith(".pdf"):
+        # Accept direct PDF URLs even when they include query/hash suffixes,
+        # e.g. ".../paper.pdf?download=1".
+        if re.search(r"\.pdf(?:$|[?#])", lowered):
             return True
-        return "/pdf/" in lowered
+        parsed = urllib.parse.urlparse(lowered)
+        return "/pdf/" in (parsed.path or "")
 
     def _infer_arxiv_id(self, paper: PaperRecord) -> str:
         candidates = [
@@ -292,7 +312,7 @@ class DocumentProcessor:
                     identifier,
                 )
                 return candidate
-        if not self.semantic_scholar_api_key:
+        if not paper.title.strip():
             return ""
         payload = self._search_semantic_scholar_by_title(paper.title, fields)
         candidate = self._semantic_scholar_open_access_pdf(payload)

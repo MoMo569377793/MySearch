@@ -800,9 +800,15 @@ class Database:
                     source_urls=source_urls,
                 )
             )
-        entries.sort(key=lambda entry: entry.paper.id, reverse=True)
-        entries.sort(key=lambda entry: entry.paper.published_at or entry.paper.created_at or "", reverse=True)
-        entries.sort(key=lambda entry: entry.topic_name)
+        entries.sort(
+            key=lambda entry: (
+                entry.topic_name,
+                -float(entry.score),
+                -(int(entry.paper.year) if entry.paper.year is not None else -1),
+                entry.paper.published_at or entry.paper.created_at or "",
+                -int(entry.paper.id),
+            )
+        )
         return entries
 
     def fetch_enrichment_candidates(

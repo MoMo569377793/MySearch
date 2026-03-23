@@ -30,7 +30,17 @@ def normalize_title(text: str) -> str:
 
 def keyword_in_text(keyword: str, text: str) -> bool:
     normalized_keyword = normalize_title(keyword)
-    return normalized_keyword in text
+    if not normalized_keyword:
+        return False
+    normalized_text = normalize_title(text)
+    if not normalized_text:
+        return False
+    if " " in normalized_keyword:
+        pattern = r"\b" + re.escape(normalized_keyword).replace(r"\ ", r"\s+") + r"\b"
+        return re.search(pattern, normalized_text) is not None
+    suffix = r"s?" if len(normalized_keyword) >= 3 else ""
+    pattern = r"\b" + re.escape(normalized_keyword) + suffix + r"\b"
+    return re.search(pattern, normalized_text) is not None
 
 
 def unique_strings(values: list[str]) -> list[str]:

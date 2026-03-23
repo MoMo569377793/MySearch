@@ -2028,14 +2028,14 @@ class LLMClient:
     def _normalize_basis(self, basis: Any, *, source_mode: str, has_fulltext: bool) -> str:
         value = str(basis or "").strip().lower()
         allowed = {"llm+pdf+metadata", "llm+fulltext+metadata", "llm+abstract+metadata"}
-        if value in allowed:
-            return value
         if source_mode == "pdf_direct":
             return "llm+pdf+metadata"
         if source_mode == "fulltext_txt":
             return "llm+fulltext+metadata"
         if source_mode == "abstract_metadata":
             return "llm+abstract+metadata"
+        if value in allowed:
+            return value
         return "llm+fulltext+metadata" if has_fulltext else "llm+abstract+metadata"
 
     def _parse_pdf_brief_summary(self, brief_text: str) -> dict[str, Any] | None:
