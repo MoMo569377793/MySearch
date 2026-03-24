@@ -158,6 +158,12 @@ class ArxivFetcher:
                     time.sleep(2 + attempt)
                     continue
                 raise
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(2 + attempt)
+                    continue
+                raise
         raise RuntimeError(f"arXiv request failed after retries: {last_error}")
 
     def _parse_feed(self, xml_text: str, query: str) -> list[PaperCandidate]:

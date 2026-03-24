@@ -426,7 +426,7 @@ class MonitorPipeline:
         for attempt in range(3):
             request = urllib.request.Request(url, headers=self._semantic_scholar_headers())
             try:
-                with urllib.request.urlopen(request, timeout=15) as response:
+                with urllib.request.urlopen(request, timeout=20) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 last_error = exc
@@ -436,7 +436,7 @@ class MonitorPipeline:
                     time.sleep(1 + attempt)
                     continue
                 return {}
-            except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(1 + attempt)
@@ -461,7 +461,7 @@ class MonitorPipeline:
         for attempt in range(3):
             request = urllib.request.Request(url, headers=self._semantic_scholar_headers())
             try:
-                with urllib.request.urlopen(request, timeout=15) as response:
+                with urllib.request.urlopen(request, timeout=20) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 last_error = exc
@@ -469,7 +469,7 @@ class MonitorPipeline:
                     time.sleep(1 + attempt)
                     continue
                 return {}
-            except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc
                 if attempt < 2:
                     time.sleep(1 + attempt)

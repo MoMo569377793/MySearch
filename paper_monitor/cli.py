@@ -5,6 +5,7 @@ import argparse
 from dataclasses import replace
 import logging
 import shlex
+from collections import Counter
 
 from paper_monitor.config import load_settings, write_default_config
 from paper_monitor.enrichment import DocumentProcessor, EnrichmentPipeline
@@ -108,6 +109,10 @@ def build_parser() -> argparse.ArgumentParser:
     paper_add_parser.add_argument("--category", action="append", help="分类标签，可重复传入")
     paper_add_parser.add_argument("--classification", default="relevant", choices=["relevant", "maybe"])
 
+    paper_set_pdf_parser = subparsers.add_parser("paper-set-pdf", help="为已有论文设置或替换 PDF 源，并重置 PDF / 全文缓存")
+    paper_set_pdf_parser.add_argument("--paper-id", type=int, required=True, help="要更新的 paper_id")
+    paper_set_pdf_parser.add_argument("--pdf-url", required=True, help="新的 PDF 下载链接，或 file:/// 开头的本地 PDF 绝对路径")
+
     paper_delete_parser = subparsers.add_parser("paper-delete", help="按 paper_id 从数据库删除论文")
     paper_delete_parser.add_argument("--paper-id", type=int, action="append", required=True, help="一个或多个 paper_id")
 
@@ -117,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
     paper_find_parser.add_argument("--doi", help="按 DOI 精确查找")
     paper_find_parser.add_argument("--arxiv-id", help="按 arXiv ID 精确查找")
     paper_find_parser.add_argument("--topic", action="append", help="仅在指定 topic id 内查找，可重复传入")
+    paper_find_parser.add_argument("--no-pdf", action="store_true", help="仅列出当前没有本地 PDF 的论文")
+    paper_find_parser.add_argument("--show-summary", action="store_true", help="同时显示当前默认摘要内容")
     paper_find_parser.add_argument("--limit", type=int, default=20, help="最多显示多少条，默认 20")
 
     preview_parser = subparsers.add_parser("paper-preview", help="仅对一篇论文做评分、下载 PDF、总结和导出，不写入数据库")
@@ -589,6 +596,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"所属领域: {', '.join(topic.display_name for topic in topics)}")
             return 0
 
+        if args.command == "paper-set-pdf":
+            try:
+                paper = db.set_paper_pdf_source(args.paper_id, args.pdf_url)
+            except KeyError:
+                print(f"未找到论文: paper_id={args.paper_id}")
+                return 1
+            print(f"已更新 PDF 源: paper_id={paper.id}")
+            print(f"标题: {paper.title}")
+            print(f"PDF URL: {paper.pdf_url}")
+            print("已重置 PDF / 全文缓存状态；不会修改主题归类、评分或已有摘要。")
+            print(
+                "建议下一步执行: "
+                f"python3 main.py --config {shlex.quote(args.config)} enrich --paper-id {paper.id} --with-llm --workers 1 --force"
+            )
+            return 0
+
         if args.command == "paper-delete":
             deleted = 0
             missing: list[int] = []
@@ -605,12 +628,58 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "paper-find":
+            if args.no_pdf:
+                matches = db.find_papers(
+                    title_substring=args.title,
+                    url_substring=args.url,
+                    doi=args.doi,
+                    arxiv_id=args.arxiv_id,
+                    topic_ids=args.topic,
+                    no_pdf=True,
+                    limit=None,
+                )
+                if not matches:
+                    print("没有找到匹配的论文。")
+                    return 0
+                display_matches = sorted(matches, key=lambda item: item.id)[: max(int(args.limit or len(matches)), 1)]
+                print(f"当前库里没有本地 PDF 的论文有 {len(matches)} 篇：")
+                source_counter: Counter[str] = Counter()
+                for paper in display_matches:
+                    print(f"- {paper.id} {paper.title}")
+                    if paper.pdf_url:
+                        print(f"  当前 pdf_url: {paper.pdf_url}")
+                    if paper.primary_url:
+                        print(f"  当前 primary_url: {paper.primary_url}")
+                    if paper.doi:
+                        print(f"  DOI: {paper.doi}")
+                    if paper.arxiv_id:
+                        print(f"  arXiv: {paper.arxiv_id}")
+                    source_mode = ""
+                    if isinstance(paper.llm_summary, dict):
+                        source_mode = str(paper.llm_summary.get("source_mode") or "").strip()
+                    summary_basis = (paper.summary_basis or "metadata-only").strip() or "metadata-only"
+                    source_label = f"{summary_basis} / {source_mode or 'unknown'}"
+                    source_counter[source_label] += 1
+                    if args.show_summary:
+                        summary_text = (paper.summary_text or "").strip()
+                        print("  当前默认摘要:")
+                        if summary_text:
+                            for line in summary_text.splitlines():
+                                print(f"    {line}")
+                        else:
+                            print("    （无）")
+                if source_counter:
+                    print("\n这些论文当前的默认摘要来源：")
+                    for label, count in sorted(source_counter.items(), key=lambda item: (-item[1], item[0])):
+                        print(f"- {label}: {count}")
+                return 0
             matches = db.find_papers(
                 title_substring=args.title,
                 url_substring=args.url,
                 doi=args.doi,
                 arxiv_id=args.arxiv_id,
                 topic_ids=args.topic,
+                no_pdf=False,
                 limit=args.limit,
             )
             if not matches:
@@ -629,6 +698,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  PDF: {'有' if paper.pdf_local_path else '无'} / 全文: {paper.fulltext_status or 'empty'}")
                 if paper.primary_url:
                     print(f"  链接: {paper.primary_url}")
+                if args.show_summary:
+                    print(f"  默认摘要来源: {paper.summary_basis or 'metadata-only'}")
+                    print("  默认摘要:")
+                    summary_text = (paper.summary_text or "").strip()
+                    if summary_text:
+                        for line in summary_text.splitlines():
+                            print(f"    {line}")
+                    else:
+                        print("    （无）")
             return 0
 
         if args.command == "fetch":

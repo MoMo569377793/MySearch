@@ -16,10 +16,11 @@ from paper_monitor.enrichment import (
     EnrichmentPipeline,
     _summary_has_complete_pdf_output,
 )
-from paper_monitor.fetchers.arxiv import extract_arxiv_id
+from paper_monitor.fetchers.arxiv import ArxivFetcher, extract_arxiv_id
+from paper_monitor.fetchers.dblp import DBLPFetcher
 from paper_monitor.llm import LLMClient, TASK_TOPIC_DIGEST, looks_like_invalid_direct_pdf_summary
 from paper_monitor.llm_registry import LLMRuntimeVariant
-from paper_monitor.models import FetchPlan, LLMResult
+from paper_monitor.models import FetchPlan, GenericSourceConfig, LLMResult
 from paper_monitor.models import PaperCandidate, PaperLLMSummary, PaperRecord, ReportEntry, RunStats, TopicConfig, TopicEvaluation
 from paper_monitor.pipeline import MonitorPipeline
 from paper_monitor.reports import (
@@ -40,6 +41,75 @@ FIXTURE_CONFIG_POE = REPO_ROOT / "config" / "config-poe.json"
 
 
 class MonitorPipelineTest(unittest.TestCase):
+    def test_arxiv_request_retries_timeout_error(self) -> None:
+        fetcher = ArxivFetcher(GenericSourceConfig(timeout_seconds=40))
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b"<feed />"
+
+        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError("timed out"), DummyResponse()]) as urlopen:
+            payload = fetcher._request_feed("http://example.invalid/feed")
+
+        self.assertEqual(payload, "<feed />")
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_dblp_request_retries_timeout_error(self) -> None:
+        fetcher = DBLPFetcher(GenericSourceConfig(timeout_seconds=30))
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{\"result\": {\"hits\": {\"hit\": []}}}'
+
+        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError("timed out"), DummyResponse()]) as urlopen:
+            payload = fetcher._fetch_with_retry("https://dblp.org/search/publ/api?q=test", "test")
+
+        self.assertEqual(payload, '{"result": {"hits": {"hit": []}}}')
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_semantic_scholar_title_search_retries_timeout_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(FIXTURE_CONFIG_POE.read_text(encoding="utf-8"), encoding="utf-8")
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            pipeline = MonitorPipeline(settings, db)
+
+            class DummyResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self) -> bytes:
+                    return b'{"data":[{"title":"FlashAttention","citationCount":123,"influentialCitationCount":12}]}'
+
+            with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError("timed out"), DummyResponse()]) as urlopen:
+                payload = pipeline._search_semantic_scholar_by_title(
+                    "FlashAttention",
+                    "title,year,citationCount,influentialCitationCount",
+                )
+
+            self.assertEqual(payload["data"][0]["citationCount"], 123)
+            self.assertEqual(urlopen.call_count, 2)
+            db.close()
+
     def test_extract_arxiv_id_supports_abs_and_pdf_urls(self) -> None:
         self.assertEqual(extract_arxiv_id("https://arxiv.org/abs/2501.12345v2"), "2501.12345v2")
         self.assertEqual(extract_arxiv_id("https://arxiv.org/pdf/2501.12345v2.pdf"), "2501.12345v2")
@@ -133,6 +203,163 @@ class MonitorPipelineTest(unittest.TestCase):
             self.assertEqual(payload["paper"]["title"], "Autofilled Matrix-Free Preview Paper")
             self.assertEqual(payload["paper"]["doi"], "10.1000/autofill-preview")
             self.assertEqual(payload["paper"]["arxiv_id"], "2501.12345v2")
+
+    def test_paper_set_pdf_updates_existing_paper_without_touching_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(
+                FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            add_exit = cli_main(
+                [
+                    "--config",
+                    str(root / "config" / "config.json"),
+                    "paper-add",
+                    "--topic",
+                    "ai_operator_acceleration",
+                    "--title",
+                    "Manual PDF Patch Test",
+                    "--primary-url",
+                    "https://example.com/paper",
+                    "--pdf-url",
+                    "https://example.com/old.pdf",
+                ]
+            )
+            self.assertEqual(add_exit, 0)
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            paper = db.find_papers(title_substring="Manual PDF Patch Test", limit=1)[0]
+            db.update_paper_assets(
+                paper.id,
+                pdf_local_path="/tmp/old.pdf",
+                pdf_status="downloaded",
+                pdf_downloaded_at="2026-03-24T09:00:00+08:00",
+                fulltext_txt_path="/tmp/old.txt",
+                fulltext_excerpt="old excerpt",
+                fulltext_status="extracted",
+                page_count=12,
+            )
+            match_count_before = db.connection.execute(
+                "SELECT COUNT(*) FROM matches WHERE paper_id = ?",
+                (paper.id,),
+            ).fetchone()[0]
+            db.close()
+
+            set_exit = cli_main(
+                [
+                    "--config",
+                    str(root / "config" / "config.json"),
+                    "paper-set-pdf",
+                    "--paper-id",
+                    str(paper.id),
+                    "--pdf-url",
+                    "file:///tmp/new.pdf",
+                ]
+            )
+            self.assertEqual(set_exit, 0)
+
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+            updated = db.get_paper(paper.id)
+            match_count_after = db.connection.execute(
+                "SELECT COUNT(*) FROM matches WHERE paper_id = ?",
+                (paper.id,),
+            ).fetchone()[0]
+            self.assertEqual(updated.pdf_url, "file:///tmp/new.pdf")
+            self.assertEqual(updated.pdf_status, "pending")
+            self.assertEqual(updated.pdf_local_path, "")
+            self.assertEqual(updated.fulltext_txt_path, "")
+            self.assertEqual(updated.fulltext_excerpt, "")
+            self.assertEqual(updated.fulltext_status, "empty")
+            self.assertIsNone(updated.page_count)
+            self.assertEqual(match_count_before, match_count_after)
+            db.close()
+
+    def test_paper_find_no_pdf_lists_titles_and_summary_source_distribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            (root / "config" / "config.json").write_text(
+                FIXTURE_CONFIG_IKUN.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            settings = load_settings(root / "config" / "config.json")
+            db = Database(settings.database_path, settings.timezone)
+            db.initialize()
+
+            no_pdf_id, _ = db.upsert_paper(
+                PaperCandidate(
+                    source_name="manual",
+                    source_paper_id="manual-no-pdf",
+                    query_text="manual",
+                    title="No PDF Paper",
+                    abstract="abstract",
+                    primary_url="https://example.com/no-pdf",
+                    venue="manual",
+                    raw={"manual": True},
+                )
+            )
+            with_pdf_id, _ = db.upsert_paper(
+                PaperCandidate(
+                    source_name="manual",
+                    source_paper_id="manual-with-pdf",
+                    query_text="manual",
+                    title="With PDF Paper",
+                    abstract="abstract",
+                    primary_url="https://example.com/with-pdf",
+                    venue="manual",
+                    raw={"manual": True},
+                )
+            )
+            db.update_paper_analysis(
+                no_pdf_id,
+                summary_text="summary",
+                summary_basis="llm+abstract+metadata",
+                tags=[],
+                llm_summary={"source_mode": "abstract_metadata"},
+            )
+            db.update_paper_assets(
+                with_pdf_id,
+                pdf_local_path="/tmp/with.pdf",
+                pdf_status="downloaded",
+                pdf_downloaded_at="2026-03-24T10:00:00+08:00",
+                fulltext_txt_path="/tmp/with.txt",
+                fulltext_excerpt="excerpt",
+                fulltext_status="extracted",
+                page_count=3,
+            )
+            db.close()
+
+            buffer = io.StringIO()
+            with mock.patch("sys.stdout", new=buffer):
+                exit_code = cli_main(
+                    [
+                        "--config",
+                        str(root / "config" / "config.json"),
+                        "paper-find",
+                        "--no-pdf",
+                        "--show-summary",
+                        "--limit",
+                        "10",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            output = buffer.getvalue()
+            self.assertIn("当前库里没有本地 PDF 的论文有 1 篇", output)
+            self.assertIn("- 1 No PDF Paper", output)
+            self.assertIn("当前 primary_url: https://example.com/no-pdf", output)
+            self.assertIn("当前默认摘要:", output)
+            self.assertIn("summary", output)
+            self.assertIn("这些论文当前的默认摘要来源：", output)
+            self.assertIn("- llm+abstract+metadata / abstract_metadata: 1", output)
+            self.assertNotIn("With PDF Paper", output)
 
     def test_complete_pdf_output_requires_pdf_basis(self) -> None:
         summary = type(

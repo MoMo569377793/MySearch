@@ -136,6 +136,15 @@ class DBLPFetcher:
                 LOGGER.warning("dblp query failed: %s (%s)", query, exc)
                 return None
             except urllib.error.URLError as exc:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                LOGGER.warning("dblp query failed: %s (%s)", query, exc)
+                return None
+            except TimeoutError as exc:
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
                 LOGGER.warning("dblp query failed: %s (%s)", query, exc)
                 return None
         return None

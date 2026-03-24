@@ -646,13 +646,13 @@ DEFAULT_CONFIG = {
         "arxiv": {
             "enabled": True,
             "max_results": 30,
-            "timeout_seconds": 20,
+            "timeout_seconds": 40,
             "user_agent": "paper-monitor/0.1 (+local)",
         },
         "dblp": {
             "enabled": True,
             "max_results": 20,
-            "timeout_seconds": 20,
+            "timeout_seconds": 30,
             "user_agent": "paper-monitor/0.1 (+local)",
         },
         "google_scholar_alerts": {

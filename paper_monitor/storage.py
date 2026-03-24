@@ -369,7 +369,8 @@ class Database:
         doi: str | None = None,
         arxiv_id: str | None = None,
         topic_ids: list[str] | None = None,
-        limit: int = 20,
+        no_pdf: bool = False,
+        limit: int | None = 20,
     ) -> list[PaperRecord]:
         where_clauses: list[str] = []
         params: list[Any] = []
@@ -417,20 +418,24 @@ class Database:
             )
             params.extend(topic_ids)
 
+        if no_pdf:
+            where_clauses.append("COALESCE(p.pdf_local_path, '') = ''")
+
         where_sql = ""
         if where_clauses:
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
-        rows = self.connection.execute(
-            f"""
+        sql = f"""
             SELECT DISTINCT p.*
             FROM papers p
             {where_sql}
             ORDER BY COALESCE(NULLIF(p.published_at, ''), p.created_at) DESC, p.id DESC
-            LIMIT ?
-            """,
-            [*params, max(int(limit or 20), 1)],
-        ).fetchall()
+        """
+        query_params: list[Any] = list(params)
+        if limit is not None:
+            sql += "\nLIMIT ?"
+            query_params.append(max(int(limit or 20), 1))
+        rows = self.connection.execute(sql, query_params).fetchall()
         return [self._row_to_paper(row) for row in rows]
 
     def _row_to_paper(self, row: sqlite3.Row) -> PaperRecord:
@@ -524,6 +529,24 @@ class Database:
             ),
         )
         self.connection.commit()
+
+    def set_paper_pdf_source(self, paper_id: int, pdf_url: str) -> PaperRecord:
+        row = self.connection.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"paper not found: {paper_id}")
+        now = now_iso(self.timezone_name)
+        self.connection.execute(
+            """
+            UPDATE papers
+            SET pdf_url = ?, pdf_local_path = '', pdf_status = 'pending', pdf_downloaded_at = NULL,
+                fulltext_txt_path = '', fulltext_excerpt = '', fulltext_status = 'empty', page_count = NULL,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (pdf_url, now, paper_id),
+        )
+        self.connection.commit()
+        return self.get_paper(paper_id)
 
     def upsert_paper_llm_summary(
         self,
